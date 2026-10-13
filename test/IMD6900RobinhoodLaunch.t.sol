@@ -72,6 +72,13 @@ contract Engine is Trader {
     function openCount() external pure returns (uint256) { return 0; }
 }
 
+/// A payee that refuses ETH until told otherwise
+contract Refuser {
+    bool public open;
+    function setOpen(bool o) external { open = o; }
+    receive() external payable { require(open, "no"); }
+}
+
 /// A perps engine that takes its fee back the way PerpSwapLib.swapLeg does: checkpoint, swap, refund, in its unlock
 contract RefundingEngine {
     IPoolManager immutable pm;
@@ -172,7 +179,7 @@ contract IMD6900RobinhoodLaunchTest is Test {
     bytes32 SALT;
 
     function setUp() public {
-        PM = IPoolManager(vm.deployCode("PoolManager.sol:PoolManager", abi.encode(address(this))));
+        PM = IPoolManager(address(new PoolManager(address(this))));
         imdstr = new MockImdstr();
         L = _newLaunch(OWNER, PM, address(imdstr), TL);
         hook = L.createHook(HookSalt.mine(L));
@@ -464,6 +471,39 @@ contract IMD6900RobinhoodLaunchTest is Test {
         assertEq(L.imdBucket(), bucket - 0.1 ether, "at most 0.1 ETH a call");
         assertEq(L.imdBurned(), got);
         t;
+    }
+
+    function test_ARefusedShareIsOwedNotReSplit() public {
+        _launch();
+        Refuser r = new Refuser();
+        address[] memory to = new address[](2);
+        uint16[] memory bps = new uint16[](2);
+        (to[0], bps[0], to[1], bps[1]) = (address(r), 9_000, L.IMD_BURN(), 1_000);
+        vm.prank(TL);
+        L.setPayees(to, bps);
+        vm.deal(address(L), 1 ether);
+        L.split();
+        assertEq(L.owed(address(r)), 0.9 ether, "the refused 90% is booked to it");
+        assertEq(L.imdBucket(), 0.1 ether);
+        for (uint256 i; i < 5; ++i) L.split(); // before the fix every call re-split it: 10% more to $IMD each time
+        assertEq(L.imdBucket(), 0.1 ether, "no drift into the $IMD bucket");
+        assertEq(L.owed(address(r)), 0.9 ether);
+        r.setOpen(true);
+        L.split();
+        assertEq(address(r).balance, 0.9 ether, "paid in full once it accepts");
+        assertEq(L.owedTotal(), 0);
+        // dropping a payee cancels what it was owed: divided again among the new payees
+        r.setOpen(false);
+        vm.deal(address(L), address(L).balance + 1 ether);
+        L.split();
+        assertEq(L.owed(address(r)), 0.9 ether);
+        (to[0], to[1]) = (POT, L.IMD_BURN());
+        vm.prank(TL);
+        L.setPayees(to, bps);
+        assertEq(L.owedTotal(), 0, "cancelled");
+        uint256 potBefore = POT.balance;
+        L.split();
+        assertEq(POT.balance - potBefore, 0.81 ether, "90% of the 0.9 ETH, now the pot's");
     }
 
     function test_OnlyTheTimelockSetsTheSplit() public {

@@ -42,7 +42,7 @@ contract PerpsTest is Test {
     PoolKey k;
 
     function setUp() public {
-        PM = IPoolManager(vm.deployCode("PoolManager.sol:PoolManager", abi.encode(address(this))));
+        PM = IPoolManager(address(new PoolManager(address(this))));
         (L, hook, pool) = _deploy();
         t = _launch(L);
         vm.deal(address(this), 1 ether);

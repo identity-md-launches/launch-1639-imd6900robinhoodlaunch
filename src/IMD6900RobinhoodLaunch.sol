@@ -115,6 +115,11 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     address[8] internal _payees;
     uint16[8] internal _shares;
     uint8 internal _payeeCount;
+    /// @notice ETH booked to payees that refused their share ({owed}): offered again on the next split, never
+    ///         divided again (so a refusing payee's share can't drift into the others')
+    uint256 public owedTotal;
+    uint256 internal _owedEpoch;
+    mapping(uint256 => mapping(address => uint256)) internal _owed;
 
     event HookCreated(address hook, bytes32 salt);
     event ClaimsSet(bytes32 root, uint256 total, uint256 deadline);
@@ -126,6 +131,7 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     event FeesReceived(address indexed from, uint256 amount);
     event Split(uint256 amount);
     event PayFailed(address payee, uint256 amount);
+    event OwedCancelled(uint256 amount);
     event PayeesSet(address[] payees, uint16[] shares);
     event EthRecovered(address to, uint256 amount);
     event ExcessReleased(address to, uint256 amount);
@@ -235,6 +241,11 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         for (uint256 i; i < n; ++i) (to[i], bps[i]) = (_payees[i], _shares[i]);
     }
 
+    /// @notice What a payee refused and is offered again on the next split
+    function owed(address payee) public view returns (uint256) {
+        return _owed[_owedEpoch][payee];
+    }
+
     /// @notice What is still reserved for claims
     function claimReserve() public view returns (uint256) {
         return unclaimedReleased ? 0 : claimTotal - claimedTotal;
@@ -331,6 +342,7 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         if (msg.sender != timelock) revert NotTimelock();
         uint256 n = to.length;
         if (n == 0 || n > MAX_PAYEES || n != bps.length) revert BadPayees();
+        (address[] memory old,) = payees(); // before the new list replaces it
         uint256 sum;
         for (uint256 i; i < n; ++i) {
             if (to[i] == address(0)) revert BadPayees();
@@ -339,6 +351,19 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         }
         if (sum != 10_000) revert BadPayees();
         _payeeCount = uint8(n);
+        // what was booked to a payee the new list drops is cancelled: the next split divides it among the new payees
+        for (uint256 i; i < old.length; ++i) {
+            uint256 due = owed(old[i]);
+            if (due == 0) continue;
+            bool kept;
+            for (uint256 j; j < n && !kept; ++j) {
+                kept = to[j] == old[i];
+            }
+            if (kept) continue;
+            owedTotal -= due;
+            _owed[_owedEpoch][old[i]] = 0;
+            emit OwedCancelled(due);
+        }
         emit PayeesSet(to, bps);
     }
 
@@ -349,7 +374,14 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         if (amount == 0) amount = address(this).balance;
         if (amount == 0) revert NoEth();
         SafeTransferLib.safeTransferETH(to, amount);
-        if (imdBucket > address(this).balance) imdBucket = address(this).balance;
+        uint256 left = address(this).balance;
+        if (imdBucket + owedTotal > left) {
+            if (owedTotal != 0) {
+                emit OwedCancelled(owedTotal);
+                (owedTotal, _owedEpoch) = (0, _owedEpoch + 1);
+            }
+            if (imdBucket > left) imdBucket = left;
+        }
         emit EthRecovered(to, amount);
     }
 
@@ -441,18 +473,29 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     ///         for the next split.
     function split() public nonReentrant returns (uint256 amount) {
         if (token == address(0)) revert NotLaunched();
-        amount = address(this).balance - imdBucket;
-        if (amount == 0) return 0;
+        amount = address(this).balance - imdBucket - owedTotal;
+        if (amount == 0 && owedTotal == 0) return 0;
         (address[] memory to, uint16[] memory bps) = payees();
         for (uint256 i; i < to.length; ++i) {
             uint256 part = (amount * bps[i]) / 10_000;
-            if (part == 0) continue;
             if (to[i] == imdBurn) {
                 imdBucket += part;
                 continue;
             }
-            (bool ok,) = to[i].call{value: part}("");
-            if (!ok) emit PayFailed(to[i], part);
+            uint256 due = owed(to[i]);
+            uint256 pay = part + due;
+            if (pay == 0) continue;
+            (bool ok,) = to[i].call{value: pay}("");
+            if (ok) {
+                if (due != 0) {
+                    owedTotal -= due;
+                    _owed[_owedEpoch][to[i]] = 0;
+                }
+            } else {
+                owedTotal += part;
+                _owed[_owedEpoch][to[i]] = pay;
+                emit PayFailed(to[i], pay);
+            }
         }
         emit Split(amount);
     }
