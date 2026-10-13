@@ -326,6 +326,26 @@ contract LaunchHandler is Test {
         ghostPayeesSet = true;
     }
 
+    /// @dev The owner releases the unclaimed reserve after the deadline: burned, sent out, or kept here for the timelock
+    ///      (booked as held, so the reserve-plus-excess invariant sees whether the self-release strands it)
+    function releaseUnclaimed(uint256 mode) external {
+        mode = bound(mode, 0, 2);
+        address to = mode == 0 ? address(0) : mode == 1 ? SINK : address(L);
+        uint256 supplyBefore = IERC20View(coin).totalSupply();
+        uint256 heldBefore = L.excessHeld();
+        uint256 unclaimed = L.claimTotal() - L.claimedTotal();
+        bool open = block.timestamp < L.claimDeadline();
+        vm.prank(OWNER);
+        try L.releaseUnclaimed(to) {
+            assertFalse(open, "the unclaimed reserve was released while the claims were open");
+            ghostCoinBurned += supplyBefore - IERC20View(coin).totalSupply();
+            if (to == address(L)) assertEq(L.excessHeld() - heldBefore, unclaimed, "kept reserve not booked as held");
+            if (to == address(0)) {
+                assertEq(supplyBefore - IERC20View(coin).totalSupply(), unclaimed, "burn != reserve");
+            }
+        } catch {}
+    }
+
     function releaseImdstr(uint256 part) external {
         uint256 held = imdstr.balanceOf(address(L));
         if (held == 0) return;
@@ -409,6 +429,25 @@ contract LaunchInvariantsTest is LaunchedFixture {
         h.recoverEth(address(L).balance);
         assertGt(h.ghostRecovered(), 0);
         assertEq(L.owedTotal(), 0, "recovering everything cancels the owed book");
+    }
+
+    /// The handler's release of the unclaimed reserve: refused while the claims are open, then kept here as held
+    /// coins the timelock can release, and refused a second time
+    function test_TheHandlerReleasesTheUnclaimedReserve() public {
+        h.claim(0, AA);
+        uint256 heldBefore = L.excessHeld();
+        h.releaseUnclaimed(2); // the claims are open: refused, nothing moves
+        assertFalse(L.unclaimedReleased());
+        vm.warp(L.claimDeadline());
+        h.releaseUnclaimed(2);
+        assertTrue(L.unclaimedReleased());
+        assertEq(L.claimReserve(), 0);
+        assertEq(L.excessHeld(), heldBefore + BB + CC, "the kept reserve isn't the timelock's to move");
+        h.releaseExcess(L.excessHeld(), true);
+        assertEq(L.excessHeld(), 0);
+        assertEq(IERC20View(coin).balanceOf(address(L)), 0, "coins stranded in the launch");
+        h.releaseUnclaimed(0); // once only
+        assertEq(h.ghostCoinBurned(), heldBefore + BB + CC);
     }
 
     /// The coins the launch holds are exactly the claims' reserve plus what it holds for the timelock: a claim, a
@@ -519,6 +558,8 @@ contract PerpsHandler is Test {
     uint256 public ghostFlushed;
     uint256 public ghostEthStaked;
     uint256 public ghostEthUnstaked;
+    uint256 public ghostTokYieldClaimed;
+    uint256 public ghostTokYieldClaims;
 
     constructor(IPoolManager pm, IMD6900RobinhoodLaunch l, PerpEngine e, PerpVault v, address coin_, address tl) {
         (PM, L, engine, vault, coin, TL) = (pm, l, e, v, coin_, tl);
@@ -701,6 +742,25 @@ contract PerpsHandler is Test {
         } catch {}
     }
 
+    /// @dev A token staker claims its short-side ETH yield: it is paid exactly what the vault's view promised, in ETH
+    function claimTokYield(uint256 who) external {
+        address s = address(spot[bound(who, 0, 1)]);
+        uint256 promised = vault.pendingTokYield(s);
+        uint256 before = s.balance;
+        uint256 potBefore = engine.tokYieldEth();
+        vm.prank(s);
+        try vault.claimTokYield() returns (uint256 paid) {
+            ++ghostTokYieldClaims;
+            ghostTokYieldClaimed += paid;
+            assertEq(paid, promised, "claimTokYield paid other than pendingTokYield promised");
+            assertEq(s.balance - before, paid, "claimed yield != received");
+            assertEq(potBefore - engine.tokYieldEth(), paid, "the yield wasn't paid from the token side's pot");
+            assertEq(vault.pendingTokYield(s), 0, "yield still pending after a claim");
+        } catch {
+            assertEq(promised, 0, "a promised yield couldn't be claimed");
+        }
+    }
+
     function flushFees() external {
         uint256 potBefore = L.perpFeeTo().balance;
         try engine.flushFees() returns (uint256 amount) {
@@ -838,6 +898,40 @@ contract PerpsInvariantsTest is LaunchedFixture {
         h.flushFees();
         assertGt(h.ghostFlushed(), 0, "no fees to flush");
         assertEq(engine.feesOwed(), 0);
+    }
+
+    /// The token side's yield is conserved: what the stakers can claim is in the engine's pot, and what they have
+    /// claimed never exceeds what the engine credited the token side
+    function invariant_TheTokenYieldIsBacked() public view {
+        uint256 owed = vault.pendingTokYield(address(h.spot(0))) + vault.pendingTokYield(address(h.spot(1)));
+        assertLe(owed, engine.tokYieldEth(), "token stakers are owed more yield than the pot holds");
+        assertLe(h.ghostTokYieldClaimed(), engine.tokYieldCumulative(), "more yield claimed than credited");
+        assertLe(
+            h.ghostTokYieldClaimed() + engine.tokYieldEth(),
+            engine.tokYieldCumulative(),
+            "the pot plus what was claimed exceeds what was credited"
+        );
+    }
+
+    /// The short side's fee reaches the token stakers (to the wei's resolution the 1e36 index gives) and is claimable
+    function test_TheHandlerClaimsTheTokenYield() public {
+        h.depositEth(0, 5 ether);
+        h.spotBuy(0, 2 ether);
+        h.depositToken(0, IERC20View(coin).balanceOf(address(h.spot(0))));
+        h.openShort(2, 0.1 ether, 2);
+        assertEq(h.ghostOpens(), 1, "the short didn't open");
+        uint256 credited = engine.tokYieldCumulative();
+        assertGt(credited, 0, "the short credited no token-side yield");
+        uint256 pending = vault.pendingTokYield(address(h.spot(0)));
+        // the only staker: everything credited, less at most a wei of the fold's floor
+        assertLe(pending, credited);
+        assertGe(pending + 1, credited, "the sole token staker lost yield to rounding");
+        h.claimTokYield(0);
+        assertEq(h.ghostTokYieldClaims(), 1);
+        assertEq(h.ghostTokYieldClaimed(), pending);
+        // a staker with no stake has nothing to claim and is refused
+        h.claimTokYield(1);
+        assertEq(h.ghostTokYieldClaims(), 1, "a staker with nothing owed claimed");
     }
 
     /// The launch holds nothing of the perps' fees: every wei the engine flushes goes straight on to the pot
