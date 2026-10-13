@@ -99,6 +99,9 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     /// @notice ETH set aside for $IMD's burn, spent by {burnImd}; and what it has bought and sent so far
     uint256 public imdBucket;
     uint256 public imdBurned;
+    /// @notice {burnImd}: who may (the owner while unset; the timelock's {setImdKeeper}) and the next block it may
+    uint256 public nextImdBurnBlock;
+    address public imdKeeper;
     /// @notice $IMD's Robinhood pool: ETH / $IMD at this fee, tick spacing and hooks (the timelock may repoint it)
     uint24 public imdPoolFee = 10_000;
     int24 public imdPoolTickSpacing = 100;
@@ -132,6 +135,7 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     event Split(uint256 amount);
     event PayFailed(address payee, uint256 amount);
     event OwedCancelled(uint256 amount);
+    event ImdKeeperSet(address keeper);
     event PayeesSet(address[] payees, uint16[] shares);
     event EthRecovered(address to, uint256 amount);
     event ExcessReleased(address to, uint256 amount);
@@ -160,6 +164,11 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     error BadPayees();
     error NotTimelock();
     error OnlyPoolManager();
+    error BurnRateLimited();
+    error IncompleteImdBuy();
+    error BadTo();
+    error NoRenounce();
+    error NotKeeper();
 
     /// @param owner_       the team wallet: launches, sets the claim list and the payees
     /// @param poolManager_ Uniswap v4's PoolManager on Robinhood Chain
@@ -175,28 +184,21 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
 
     /*                              THE HOOK                                */
 
-    /// @notice Creates the hook at `salt` and wires the pool to it; anyone, once. The salt is mined off-chain
-    ///         (script/launch.sh hook): its CREATE2 address from here, for {hookInitCodeHash}, must carry exactly
-    ///         {FLAGS} in its low 14 bits and not start with 0x91. Mining it here instead would cost the deploy a random
-    ///         ~2.6M gas on average and, about one address in fifty, more than a transaction can hold.
+    /// @notice Creates the hook at `salt` and wires the pool to it; anyone, once. The locked pool creates it
+    ///         (IMD6900LockedPool.createHook: CREATE2 from the pool, so the salt is mined against the pool's address
+    ///         and {hookInitCodeHash}); this contract records it. Mining it on chain would cost a random ~2.6M gas.
     function createHook(bytes32 salt) external returns (IMD6900Hook) {
         if (address(hook) != address(0)) revert HookExists();
-        bytes memory init = _hookInitCode();
-        address h;
-        assembly ("memory-safe") {
-            h := create2(0, add(init, 0x20), mload(init), salt)
-        }
-        if (h == address(0) || uint160(h) & Hooks.ALL_HOOK_MASK != FLAGS || uint160(h) >> 152 == 0x91) revert BadHook();
-        pool.setHook(h);
+        address h = pool.createHook(salt);
         hook = IMD6900Hook(h);
         hookSalt = salt;
         emit HookCreated(h, salt);
         return IMD6900Hook(h);
     }
 
-    /// @notice keccak256 of the hook's creation code with its constructor arguments: the init code hash to mine against
+    /// @notice The hook's init code hash, to mine its salt against (with the pool's address as the deployer)
     function hookInitCodeHash() external view returns (bytes32) {
-        return keccak256(_hookInitCode());
+        return pool.hookInitCodeHash();
     }
 
     /// @notice Before the launch, the opening buy's ETH (anyone may send it, only the owner takes it back); after, fees
@@ -239,6 +241,11 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         }
         (to, bps) = (new address[](n), new uint16[](n));
         for (uint256 i; i < n; ++i) (to[i], bps[i]) = (_payees[i], _shares[i]);
+    }
+
+    /// @notice The owner can't be renounced: the claims, the launch and the $IMD buys need one
+    function renounceOwnership() public payable override onlyOwner {
+        revert NoRenounce();
     }
 
     /// @notice What a payee refused and is offered again on the next split
@@ -389,6 +396,7 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     ///         behind the timelock's delay, public for all of it
     function releaseExcess(uint256 amount, address to) external nonReentrant {
         if (msg.sender != timelock) revert NotTimelock();
+        if (to == address(this)) revert BadTo(); // it is here already
         if (amount == 0) amount = excessHeld;
         if (amount == 0 || amount > excessHeld) revert ZeroAmount();
         excessHeld -= amount;
@@ -434,6 +442,13 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         emit ImdBurnSet(executor);
     }
 
+    /// @notice Who may run {burnImd} (zero: the owner)
+    function setImdKeeper(address keeper) external {
+        if (msg.sender != timelock) revert NotTimelock();
+        imdKeeper = keeper;
+        emit ImdKeeperSet(keeper);
+    }
+
     /// @notice Repoints the perps engine's fees
     function setPerpFeeTo(address to) external {
         if (msg.sender != timelock) revert NotTimelock();
@@ -460,7 +475,7 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         bytes32 leaf = keccak256(bytes.concat(keccak256(abi.encode(msg.sender, allowance))));
         if (!_verify(proof, claimRoot, leaf)) revert BadProof();
         uint256 done = claimedBy[msg.sender] + amount;
-        if (done > allowance) revert OverClaim();
+        if (done > allowance || amount > claimTotal - claimedTotal) revert OverClaim();
         claimedBy[msg.sender] = done;
         claimedTotal += amount;
         SafeTransferLib.safeTransferFrom(imdstr, msg.sender, address(this), amount);
@@ -500,12 +515,18 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         emit Split(amount);
     }
 
-    /// @notice Buys $IMD with what is set aside for its burn, at most {IMD_BUY_MAX} a call, and sends it to IMD's burn
-    ///         executor (anyone can then bridge it to Base, where it is destroyed). Anyone.
+    /// @notice Buys $IMD with what is set aside for its burn, one buy of at most {IMD_BUY_MAX} per block, and sends it
+    ///         to IMD's burn executor (anyone can then bridge it to Base, where it is destroyed). The keeper only
+    ///         ({imdKeeper}, the owner by default): it quotes the buy and passes the floor, the buy's price protection.
+    ///         An incomplete fill reverts, keeping the unspent ETH reserved for the burn.
     /// @param minImd the least $IMD the buy may return
     function burnImd(uint256 minImd) external nonReentrant returns (uint256 imd) {
+        address keeper = imdKeeper;
+        if (msg.sender != (keeper == address(0) ? owner() : keeper)) revert NotKeeper();
+        if (block.number < nextImdBurnBlock) revert BurnRateLimited();
         uint256 spend = imdBucket < IMD_BUY_MAX ? imdBucket : IMD_BUY_MAX;
         if (spend == 0) revert NoEth();
+        nextImdBurnBlock = block.number + 1;
         imdBucket -= spend;
         imd = abi.decode(poolManager.unlock(abi.encode(uint8(1), spend)), (uint256));
         if (imd < minImd) revert Short(imd);
@@ -558,16 +579,13 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         BalanceDelta d = poolManager.swap(key, SwapParams(true, -int256(spend), TickMath.MIN_SQRT_PRICE + 1), "");
         uint256 ethIn = uint256(uint128(-d.amount0()));
         uint256 out = uint256(uint128(d.amount1()));
+        if (what == 1 && ethIn != spend) revert IncompleteImdBuy();
         poolManager.settle{value: ethIn}();
         poolManager.take(key.currency1, address(this), out);
         return abi.encode(out);
     }
 
     /*                              INTERNAL                                */
-
-    function _hookInitCode() internal view returns (bytes memory) {
-        return abi.encodePacked(type(IMD6900Hook).creationCode, abi.encode(poolManager, address(pool), timelock));
-    }
 
     /// @dev A Merkle proof over sorted pairs
     function _verify(bytes32[] calldata proof, bytes32 root, bytes32 leaf) internal pure returns (bool) {

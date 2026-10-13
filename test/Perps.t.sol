@@ -162,6 +162,29 @@ contract PerpsTest is Test {
         assertEq(POT.balance - potBefore, owed, "all of it, as ETH, to the pot bridge");
     }
 
+    function test_TheEngineCantBeUnwiredWithPositionsOpen() public {
+        vm.prank(ALICE);
+        engine.openLong{value: 0.1 ether}(5, 0);
+        vm.prank(TL);
+        vm.expectRevert(IMD6900Hook.PerpsOpen.selector); // they close through it: unwiring would strand them
+        hook.setPerpEngine(address(0));
+        vm.prank(TL);
+        vm.expectRevert(IMD6900Hook.PerpsOpen.selector);
+        hook.setPerpEngine(address(0xBEEF));
+        // an engine that can't even say is replaceable: the way out of a broken wiring
+        vm.etch(address(engine), hex"fe");
+        vm.prank(TL);
+        hook.setPerpEngine(address(0));
+        assertEq(hook.perpEngine(), address(0));
+    }
+
+    function test_AFeeMoveKeepsTheWholePosition() public {
+        uint128 before = pool.liquidity();
+        vm.prank(TL);
+        uint128 moved = pool.lowerFee(33_300); // no positions open
+        assertEq(moved, before, "the same liquidity, not a wei less (the margin covers v4's rounding)");
+    }
+
     function test_NoFeeMoveWithAPositionOpen() public {
         vm.prank(ALICE);
         engine.openLong{value: 0.1 ether}(5, 0);

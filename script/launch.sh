@@ -103,7 +103,7 @@ case "${1:-status}" in
     # the low 14 bits are the hook's permissions, FLAGS = 0x2ac0 (ending in 2ac0 also fixes the next two bits: 4x the
     # work, still instant); Uniswap reviews 0x91… hooks by hand, so those are mined again
     while :; do
-      OUT=$(cast create2 --ends-with 2ac0 --deployer "$LAUNCH" --init-code-hash "$IH")
+      OUT=$(cast create2 --ends-with 2ac0 --deployer "$(c $LAUNCH 'pool()(address)')" --init-code-hash "$IH")  # the pool creates it
       A=$(echo "$OUT" | awk '/^Address:/{print $2}'); S=$(echo "$OUT" | awk '/^Salt:/{print $2}')
       [ "$(echo "$A" | cut -c3-4 | tr A-F a-f)" != 91 ] && break
     done

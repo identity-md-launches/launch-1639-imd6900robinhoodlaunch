@@ -20,6 +20,7 @@ interface ILockedPoolView {
     function token() external view returns (address);
     function upperTick() external view returns (int24);
     function fee() external view returns (uint24);
+    function launcher() external view returns (address);
 }
 
 /// @notice The perps engine, once there is one: liquidates every position a trade would sink, before it runs
@@ -74,6 +75,8 @@ contract IMD6900Hook is BaseHook, Ownable {
     error SweepUnavailable();
     error NoRenounce();
     error EngineSet();
+    /// @notice The wired engine reports positions open: unwiring it would leave them with nothing to close them
+    error PerpsOpen();
 
     /// @param owner_ the Robinhood timelock: the engine and the escape hatch wait out its delay
     constructor(IPoolManager poolManager_, address pool_, address owner_) BaseHook(poolManager_) {
@@ -122,6 +125,13 @@ contract IMD6900Hook is BaseHook, Ownable {
     /// @dev Replaceable: an engine whose sweep can never run blocks trading (fail closed), so the owner keeps the way
     ///      out, behind the timelock. Zero turns perps off.
     function setPerpEngine(address engine) external onlyOwner {
+        // not while the wired engine reports positions open: they close through it, and IMD6900LockedPool.lowerFee
+        // asks it before a move (an engine that can't say is replaceable: the way out of a broken wiring)
+        address cur = perpEngine;
+        if (cur != address(0) && cur != engine) {
+            (, bool open) = _openPositions(cur);
+            if (open) revert PerpsOpen();
+        }
         perpEngine = engine;
         emit PerpEngineSet(engine);
     }
@@ -227,7 +237,9 @@ contract IMD6900Hook is BaseHook, Ownable {
     ///      that sent the transaction is the liquidator and takes the keeper's cut.
     function _sweep(address sender, int256 spec, bool isBuy, uint160 limit) internal {
         address engine = perpEngine;
-        if (engine == address(0) || sender == engine) return;
+        // the launch's own swaps skip it too (the timelock's sale of held coins): a liquidation nested inside its fee
+        // refund window would take the sale's refund; what the sale sinks, the next trade's sweep closes
+        if (engine == address(0) || sender == engine || sender == ILockedPoolView(pool).launcher()) return;
         uint256 reserve = spec != 0 ? SWEEP_GAS_RESERVE + SWEEP_GAS_MIN : SWEEP_GAS_RESERVE;
         uint256 g = gasleft();
         if (g > reserve + SWEEP_GAS_MIN) {
@@ -244,12 +256,19 @@ contract IMD6900Hook is BaseHook, Ownable {
         } else if (spec != 0) {
             // too little gas to sweep: refuse the trade while positions are open, rather than trade blind; an engine
             // that can't even say whether positions are open fails closed here too (unless fail-open is set)
-            (bool ok, bytes memory ret) = engine.staticcall(abi.encodeCall(IPerpSweep.openCount, ()));
-            if (!ok || ret.length < 32) {
+            (bool known, bool open) = _openPositions(engine);
+            if (!known) {
                 if (!sweepFailOpen) revert SweepUnavailable();
-            } else if (abi.decode(ret, (uint256)) != 0) {
+            } else if (open) {
                 revert SweepGasStarved();
             }
         }
+    }
+
+    /// @dev Whether `engine` says it has positions open, and whether it could say at all
+    function _openPositions(address engine) internal view returns (bool known, bool open) {
+        (bool ok, bytes memory ret) = engine.staticcall{gas: 100_000}(abi.encodeCall(IPerpSweep.openCount, ()));
+        known = ok && ret.length >= 32;
+        open = known && abi.decode(ret, (uint256)) != 0;
     }
 }

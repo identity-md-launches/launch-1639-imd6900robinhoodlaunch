@@ -158,6 +158,7 @@ contract RobinhoodForkTest is Test {
         // the $IMD share: bought on $IMD's Robinhood pool, sent to its official burn executor
         address exec = L.IMD_BURN();
         uint256 execBefore = IERC20(L.IMD()).balanceOf(exec);
+        vm.prank(TEAM); // the keeper: the team wallet (the owner) by default
         uint256 got = L.burnImd(0);
         emit log_named_decimal_uint("$IMD bought for the burn executor", got, 18);
         assertEq(IERC20(L.IMD()).balanceOf(exec) - execBefore, got);

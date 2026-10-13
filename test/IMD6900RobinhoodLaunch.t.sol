@@ -181,7 +181,7 @@ contract IMD6900RobinhoodLaunchTest is Test {
     function setUp() public {
         PM = IPoolManager(address(new PoolManager(address(this))));
         imdstr = new MockImdstr();
-        L = new IMD6900RobinhoodLaunch(OWNER, PM, address(imdstr), TL);
+        L = _newLaunch(OWNER, PM, address(imdstr), TL);
         hook = L.createHook(HookSalt.mine(L));
         pool = L.pool();
         SALT = CoinSalt.mine(L); // the coin's 0x6900 salt, as script/mine.sh finds it
@@ -194,7 +194,7 @@ contract IMD6900RobinhoodLaunchTest is Test {
     /*                                ADMISSION                              */
 
     function test_DeploysOnAFreshChain() public {
-        IMD6900RobinhoodLaunch l = new IMD6900RobinhoodLaunch(OWNER, NO_CODE, address(imdstr), TL);
+        IMD6900RobinhoodLaunch l = _newLaunch(OWNER, NO_CODE, address(imdstr), TL);
         l.createHook(HookSalt.mine(l));
         assertEq(l.owner(), OWNER);
         assertEq(l.pool().hook(), address(l.hook()));
@@ -206,7 +206,7 @@ contract IMD6900RobinhoodLaunchTest is Test {
 
     function test_FitsOneTransaction() public {
         uint256 g = gasleft();
-        IMD6900RobinhoodLaunch l = new IMD6900RobinhoodLaunch(OWNER, PM, address(imdstr), TL);
+        IMD6900RobinhoodLaunch l = _newLaunch(OWNER, PM, address(imdstr), TL);
         uint256 used = g - gasleft();
         emit log_named_uint("launch deploy gas (the same for every deployer: no mining)", used);
         assertLt(used, 1 << 23, "half EIP-7825's per-transaction cap");
@@ -234,7 +234,7 @@ contract IMD6900RobinhoodLaunchTest is Test {
     }
 
     function test_EachDeployerMinesItsOwnHook() public {
-        IMD6900RobinhoodLaunch b = new IMD6900RobinhoodLaunch(OWNER, PM, address(imdstr), TL);
+        IMD6900RobinhoodLaunch b = _newLaunch(OWNER, PM, address(imdstr), TL);
         bytes32 s = HookSalt.mine(b);
         b.createHook(s);
         assertTrue(address(b.hook()) != address(hook));
@@ -243,7 +243,7 @@ contract IMD6900RobinhoodLaunchTest is Test {
     }
 
     function test_TheHookIsCreatedOnceAtAFittingSalt() public {
-        IMD6900RobinhoodLaunch b = new IMD6900RobinhoodLaunch(OWNER, PM, address(imdstr), TL);
+        IMD6900RobinhoodLaunch b = _newLaunch(OWNER, PM, address(imdstr), TL);
         assertEq(address(b.hook()), address(0));
         assertEq(b.pool().hook(), address(0), "the pool can't open before");
         bytes32 s = HookSalt.mine(b);
@@ -465,12 +465,25 @@ contract IMD6900RobinhoodLaunchTest is Test {
         L.harvest();
         uint256 bucket = L.imdBucket();
         assertGt(bucket, 0.1 ether, "more than one call's worth");
+        vm.expectRevert(IMD6900RobinhoodLaunch.NotKeeper.selector);
+        L.burnImd(0); // the keeper only (the owner by default): it quotes the buy and sets the floor
+        vm.prank(OWNER);
         uint256 got = L.burnImd(0);
+        vm.prank(OWNER);
+        vm.expectRevert(IMD6900RobinhoodLaunch.BurnRateLimited.selector);
+        L.burnImd(0); // one buy a block
         assertEq(MockImdstr(imd).balanceOf(L.IMD_BURN()), got, "the $IMD is at the burn executor");
         assertApproxEqRel(got, 0.099 ether * 261, 0.02e18, "0.1 ETH of $IMD, less the pool's fee");
         assertEq(L.imdBucket(), bucket - 0.1 ether, "at most 0.1 ETH a call");
         assertEq(L.imdBurned(), got);
         t;
+    }
+
+    function test_TheOwnerCantBeRenounced() public {
+        vm.prank(OWNER);
+        vm.expectRevert(IMD6900RobinhoodLaunch.NoRenounce.selector);
+        L.renounceOwnership();
+        assertEq(L.owner(), OWNER);
     }
 
     function test_ARefusedShareIsOwedNotReSplit() public {
@@ -964,5 +977,12 @@ contract IMD6900RobinhoodLaunchTest is Test {
             p[0] = leaves[i == 0 ? 1 : 0];
             p[1] = leaves[2];
         }
+    }
+
+    /// @dev The launch from its build artifact (as deployed), rather than `new`: a test contract that embeds the
+    ///      launch's creation code (with the pool's and the hook's inside it) costs the swarm's build machine too much.
+    ///      The PoolManager, which no import of ours would otherwise put in a proof's build, stays a `new`.
+    function _newLaunch(address owner_, IPoolManager pm, address imdstr_, address tl) internal returns (IMD6900RobinhoodLaunch) {
+        return IMD6900RobinhoodLaunch(payable(vm.deployCode("IMD6900RobinhoodLaunch.sol:IMD6900RobinhoodLaunch", abi.encode(owner_, pm, imdstr_, tl))));
     }
 }
