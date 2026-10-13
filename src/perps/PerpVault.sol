@@ -69,7 +69,7 @@ contract PerpVault is ReentrancyGuard {
 
     //  IMD6900: the quote side is native ETH, always. Cauldron's multi-quote and rotation paths are removed.
     // ── ETH side ──
-    uint256 public ethShares;                       // total ETH-side shares
+    uint256 public ethShares; // total ETH-side shares
     mapping(address => uint256) public ethShareOf;
     //  ── THE QUEUE IS UNITS x AN INDEX, NOT A BAG OF NOMINALS (red-team NB) ─
     //  A queued exit used to be stored as a wei nominal that {settlePendingEth}
@@ -87,32 +87,38 @@ contract PerpVault is ReentrancyGuard {
     //  claimant holds exactly `units * index`, i.e. their pro-rata share.
     //  `pendingEth`/`pendingEthOf` survive as views with their original
     //  signatures, so the ABI and every caller are unchanged.
-    uint256 public ethQueueUnits;                   // total outstanding ETH queue units
-    uint256 public ethQueueIndex;                   // wei per QSCALE units
-    uint64  public ethQueueEpoch;                   // bumped when a queue is wiped out
+    uint256 public ethQueueUnits; // total outstanding ETH queue units
+    uint256 public ethQueueIndex; // wei per QSCALE units
+    uint64 public ethQueueEpoch; // bumped when a queue is wiped out
     /// @notice `engine.totalEth()` as of the last vault action. A fall below this
     ///         that the vault did not cause is a realised loss, and the queue
     ///         bears its share of it (see {_syncEthQueue}, red-team R2A).
     uint256 public ethBackingMark;
     mapping(address => uint256) internal _ethUnitsOf;
-    mapping(address => uint64)  internal _ethEpochOf;
+    mapping(address => uint64) internal _ethEpochOf;
 
     // ── TOKEN side ──
-    uint256 public tokShares;                       // total token-side shares
+    uint256 public tokShares; // total token-side shares
     mapping(address => uint256) public tokShareOf;
-    uint256 public tokQueueUnits;                   // total outstanding token queue units
-    uint256 public tokQueueIndex;                   // token per QSCALE units
-    uint64  public tokQueueEpoch;
+    uint256 public tokQueueUnits; // total outstanding token queue units
+    uint256 public tokQueueIndex; // token per QSCALE units
+    uint64 public tokQueueEpoch;
     mapping(address => uint256) internal _tokUnitsOf;
-    mapping(address => uint64)  internal _tokEpochOf;
+    mapping(address => uint64) internal _tokEpochOf;
 
     // ── TOKEN-side ETH reward accrual (short-attributed fees, paid in ETH) ──
     /// @dev MasterChef-style accumulator: token stakers earn ETH — the engine's
     ///      short-side LP yield — pro-rata to their token shares, WITHOUT their
     ///      token principal ever converting. Claimed as ETH via {claimTokYield}.
-    uint256 private constant ACC = 1e18;
-    uint256 public accEthPerTokShare;                 // 1e18-scaled ETH per token-share
-    uint256 public lastTokYieldCum;                   // last engine.tokYieldCumulative() folded in
+    ///      ACC is OFFSET x 1e18, not 1e18: shares are minted at OFFSET (1e6) times the 18-decimal token amount, so
+    ///      with 1e18-scaling a fold could only resolve yield in steps of `tokShares / 1e18` wei (300M coins staked:
+    ///      3e14 wei a step), floored the stakers' 20% of a minimum short's fee to zero and, the watermark advancing
+    ///      regardless, left it in the engine's pot with no claimant (a deposit of 1 wei after every short stripped
+    ///      the stakers of a step each time). At 1e36 the residue of a fold is under `tokShares / 1e36` wei: less than
+    ///      a wei for any stake the supply allows. mulDiv carries the 512-bit intermediate.
+    uint256 private constant ACC = 1e36;
+    uint256 public accEthPerTokShare; // 1e36-scaled ETH per token-share
+    uint256 public lastTokYieldCum; // last engine.tokYieldCumulative() folded in
     mapping(address => uint256) public tokRewardDebt; // 1e18-scaled baseline per user
     mapping(address => uint256) public tokRewardOwed; // settled, claimable ETH per user
 
@@ -225,8 +231,7 @@ contract PerpVault is ReentrancyGuard {
         if ((ethShares | tokShares | ethQueueUnits | tokQueueUnits) != 0) return true;
         // A pending write-off forfeits every already-settled claim. Mirror that
         // lazy invalidation without requiring departed users to transact again.
-        return _settledTokYield != 0
-            && engine.tokYieldCumulative() <= engine.tokYieldEth() + totalTokYieldPulled;
+        return _settledTokYield != 0 && engine.tokYieldCumulative() <= engine.tokYieldEth() + totalTokYieldPulled;
     }
 
     // ── asset bases (what backs LIVE shares, net of queued exits) ────────────
@@ -236,6 +241,7 @@ contract PerpVault is ReentrancyGuard {
         uint256 p = pendingEth();
         return t > p ? t - p : 0;
     }
+
     /// @notice Token backing live shares = engine's token inventory minus queued.
     function assetsTok() public view returns (uint256) {
         uint256 t = engine.totalTokenAssets();
@@ -253,7 +259,7 @@ contract PerpVault is ReentrancyGuard {
     function depositEth() external payable nonReentrant returns (uint256 shares) {
         uint256 amount = msg.value;
         if (amount == 0) revert ZeroAmount();
-        _syncEthQueue();   // recognise any loss BEFORE pricing the new shares
+        _syncEthQueue(); // recognise any loss BEFORE pricing the new shares
         //  ── NO NEW MONEY INTO AN INSOLVENT QUEUE (red-team T3a) ─────────────
         //  {assetsEth} saturates at zero (`:196`), so once `pendingEth` outruns the
         //  engine's backing the share price collapses to the 1-wei OFFSET base and
@@ -283,21 +289,20 @@ contract PerpVault is ReentrancyGuard {
     /// @dev Return values checked: a token that returns false rather than
     ///      reverting would otherwise mint shares for a deposit that never moved.
     function _pull(address asset, address from, uint256 amount) private {
-        (bool ok, bytes memory ret) = asset.call(
-            abi.encodeWithSignature("transferFrom(address,address,uint256)", from, address(this), amount)
-        );
+        (bool ok, bytes memory ret) =
+            asset.call(abi.encodeWithSignature("transferFrom(address,address,uint256)", from, address(this), amount));
         if (!(ok && (ret.length == 0 || abi.decode(ret, (bool))))) revert ZeroAmount();
     }
 
     function _approve(address asset, address spender, uint256 amount) private {
-        (bool ok, ) = asset.call(abi.encodeWithSignature("approve(address,uint256)", spender, amount));
+        (bool ok,) = asset.call(abi.encodeWithSignature("approve(address,uint256)", spender, amount));
         if (!ok) revert ZeroAmount();
     }
 
     /// @notice Redeem ETH shares. Pays instantly up to the engine's FREE ETH; any
     ///         remainder is queued (claim later via {claimPendingEth}).
     function withdrawEth(uint256 shares) external nonReentrant returns (uint256 paid, uint256 queued) {
-        _syncEthQueue();   // recognise any loss BEFORE valuing the exit
+        _syncEthQueue(); // recognise any loss BEFORE valuing the exit
         uint256 bal = ethShareOf[msg.sender];
         if (shares == 0) revert ZeroShares();
         if (shares > bal) revert InsufficientShares();
@@ -335,11 +340,7 @@ contract PerpVault is ReentrancyGuard {
     ///  `owed * backing / claims` and the rest of their claim is written off, so
     ///  the loss is shared in proportion rather than by reaction speed. Rounds
     ///  DOWN (toward the vault), matching every other division here.
-    function _haircut(uint256 owed, uint256 backing, uint256 claims)
-        private
-        pure
-        returns (uint256)
-    {
+    function _haircut(uint256 owed, uint256 backing, uint256 claims) private pure returns (uint256) {
         if (claims == 0 || backing >= claims) return owed;
         return FullMath.mulDiv(owed, backing, claims);
     }
@@ -350,6 +351,7 @@ contract PerpVault is ReentrancyGuard {
     function pendingEth() public view returns (uint256) {
         return FullMath.mulDiv(ethQueueUnits, ethQueueIndex, QSCALE);
     }
+
     /// @notice `user`'s queued ETH exit, at the live index.
     function pendingEthOf(address user) public view returns (uint256) {
         if (_ethEpochOf[user] != ethQueueEpoch) return 0;
@@ -358,7 +360,9 @@ contract PerpVault is ReentrancyGuard {
 
     /// @dev Re-baseline the loss mark AFTER this vault moved ETH in or out of the
     ///      engine, so its own transfer is never read as a loss by {_syncEthQueue}.
-    function _markEth() private { ethBackingMark = engine.totalEth(); }
+    function _markEth() private {
+        ethBackingMark = engine.totalEth();
+    }
 
     /// @dev A current-quote yield amount into the ledger's fixed internal unit.
     function _toYieldUnit(uint256 v) private view returns (uint256) {
@@ -368,7 +372,10 @@ contract PerpVault is ReentrancyGuard {
     /// @dev Book `amount` of queued ETH for `user` as units at the live index.
     function _queueEth(address user, uint256 amount) private {
         uint256 u = FullMath.mulDiv(amount, QSCALE, ethQueueIndex);
-        if (_ethEpochOf[user] != ethQueueEpoch) { _ethEpochOf[user] = ethQueueEpoch; _ethUnitsOf[user] = 0; }
+        if (_ethEpochOf[user] != ethQueueEpoch) {
+            _ethEpochOf[user] = ethQueueEpoch;
+            _ethUnitsOf[user] = 0;
+        }
         _ethUnitsOf[user] += u;
         ethQueueUnits += u;
     }
@@ -425,26 +432,29 @@ contract PerpVault is ReentrancyGuard {
     function _syncEthQueue() private {
         uint256 backing = engine.totalEth();
         uint256 units = ethQueueUnits;
-        if (units == 0) { ethBackingMark = backing; return; }
+        if (units == 0) {
+            ethBackingMark = backing;
+            return;
+        }
         uint256 idx = ethQueueIndex;
         uint256 claims = FullMath.mulDiv(units, idx, QSCALE);
         uint256 mark = ethBackingMark;
         //  (1) pari passu: bear the same proportional loss a live share bears.
-        uint256 newIdx = (mark != 0 && backing < mark)
-            ? FullMath.mulDiv(idx, backing, mark)
-            : idx;
+        uint256 newIdx = (mark != 0 && backing < mark) ? FullMath.mulDiv(idx, backing, mark) : idx;
         //  (2) and never carry a claim larger than what exists.
         uint256 c2 = FullMath.mulDiv(units, newIdx, QSCALE);
         if (c2 == 0 || backing < c2) newIdx = c2 == 0 ? 0 : _haircut(newIdx, backing, c2);
         ethBackingMark = backing;
-        if (newIdx == idx) return;                             // nothing to recognise
+        if (newIdx == idx) return; // nothing to recognise
         if (newIdx == 0) {
             //  Nothing the engine holds can pay anyone: retire the whole queue so
             //  it stops blocking {deposit} and {hasStakers} (red-team R2B/R2C).
             //  The epoch bump invalidates every per-user unit balance in O(1).
             ethQueueUnits = 0;
             ethQueueIndex = QSCALE;
-            unchecked { ethQueueEpoch++; }
+            unchecked {
+                ethQueueEpoch++;
+            }
             emit QueueWrittenDown(false, claims, QSCALE);
             return;
         }
@@ -487,10 +497,17 @@ contract PerpVault is ReentrancyGuard {
         if (pendingEthOf(msg.sender) == 0) revert ZeroAmount();
         _syncEthQueue();
         uint256 owed = pendingEthOf(msg.sender);
-        if (owed == 0) { _dropEthUnits(msg.sender); emit ClaimEth(msg.sender, 0); return 0; }
+        if (owed == 0) {
+            _dropEthUnits(msg.sender);
+            emit ClaimEth(msg.sender, 0);
+            return 0;
+        }
         uint256 free = engine.freeEth();
         paid = owed <= free ? owed : free;
-        if (paid == 0) { emit ClaimEth(msg.sender, 0); return 0; }
+        if (paid == 0) {
+            emit ClaimEth(msg.sender, 0);
+            return 0;
+        }
         if (paid >= owed) {
             _dropEthUnits(msg.sender);
         } else {
@@ -534,7 +551,7 @@ contract PerpVault is ReentrancyGuard {
         uint256 last = lastTokYieldCum;
         uint256 sh = tokShares;
         if (cum != last) {
-            lastTokYieldCum = cum;                 // ALWAYS advance
+            lastTokYieldCum = cum; // ALWAYS advance
             if (sh == 0) {
                 emit UnattributedYield(cum - last);
             } else {
@@ -560,7 +577,7 @@ contract PerpVault is ReentrancyGuard {
                 if (cut > cum) cut = cum;
                 if (lost != 0) {
                     accEthPerTokShare += FullMath.mulDiv(_toYieldUnit(cut - last), ACC, sh);
-                    epochAcc = accEthPerTokShare;  // the forfeit line
+                    epochAcc = accEthPerTokShare; // the forfeit line
                     accEthPerTokShare += FullMath.mulDiv(_toYieldUnit(cum - cut), ACC, sh);
                 } else {
                     accEthPerTokShare += FullMath.mulDiv(_toYieldUnit(cum - last), ACC, sh);
@@ -574,10 +591,13 @@ contract PerpVault is ReentrancyGuard {
             // Count only the written-off amount. The current backed pot has
             // not been pulled: counting it here masks subsequent write-offs.
             totalTokYieldPulled = pulled + lost;
-            unchecked { yieldEpoch++; }
+            unchecked {
+                yieldEpoch++;
+            }
             emit TokYieldForfeited(yieldEpoch, lost);
         }
     }
+
     /// @dev Bank a user's earned-so-far ETH into their owed balance (call before
     ///      any change to their token-share count).
     function _settleTok(address user) internal {
@@ -599,6 +619,7 @@ contract PerpVault is ReentrancyGuard {
             }
         }
     }
+
     /// @dev Reset a user's reward baseline to their current share count.
     function _resetTokDebt(address user) internal {
         tokRewardDebt[user] = FullMath.mulDiv(tokShareOf[user], accEthPerTokShare, ACC);
@@ -621,12 +642,13 @@ contract PerpVault is ReentrancyGuard {
         //  {settlePendingToken} banks the write-down for any queued address.
         if (pendingTok() > engine.totalTokenAssets()) revert QueueInsolvent();
         address tok = token;
-        _syncTokYield(); _settleTok(msg.sender);      // bank rewards at old share count
+        _syncTokYield(); // bank rewards at old share count
+        _settleTok(msg.sender);
         shares = FullMath.mulDiv(amount, tokShares + OFFSET, assetsTok() + 1);
         if (shares == 0) revert ZeroShares();
         tokShares += shares;
         tokShareOf[msg.sender] += shares;
-        _resetTokDebt(msg.sender);                    // rebase baseline to new count
+        _resetTokDebt(msg.sender); // rebase baseline to new count
         // Pull from the user, then let the engine pull from us.
         _pull(tok, msg.sender, amount);
         _approve(tok, address(engine), amount);
@@ -637,13 +659,15 @@ contract PerpVault is ReentrancyGuard {
     /// @notice Claim your accrued short-side ETH reward (paid in ETH; your token
     ///         principal stays staked and protected).
     function claimTokYield() external nonReentrant returns (uint256 paid) {
-        _syncTokYield(); _settleTok(msg.sender); _resetTokDebt(msg.sender);
+        _syncTokYield();
+        _settleTok(msg.sender);
+        _resetTokDebt(msg.sender);
         uint256 owed = tokRewardOwed[msg.sender];
         if (owed == 0) revert ZeroAmount();
         paid = FullMath.mulDiv(owed, tokYieldScale, 1e18); // internal → today's quote
         _settledTokYield -= owed;
         tokRewardOwed[msg.sender] = 0;
-        totalTokYieldPulled += paid;                  // see {_syncTokYield}'s detector
+        totalTokYieldPulled += paid; // see {_syncTokYield}'s detector
         if (paid != 0) engine.withdrawTokYieldTo(paid, msg.sender); // from the segregated pot
         emit ClaimTokYield(msg.sender, paid);
     }
@@ -655,7 +679,8 @@ contract PerpVault is ReentrancyGuard {
         if (shares == 0) revert ZeroShares();
         if (shares > bal) revert InsufficientShares();
 
-        _syncTokYield(); _settleTok(msg.sender);      // bank ETH rewards at old count
+        _syncTokYield(); // bank ETH rewards at old count
+        _settleTok(msg.sender);
         uint256 owed = FullMath.mulDiv(shares, assetsTok() + 1, tokShares + OFFSET);
         uint256 free = engine.freeToken();
         paid = owed <= free ? owed : free;
@@ -663,7 +688,7 @@ contract PerpVault is ReentrancyGuard {
         // EFFECTS before the external transfer (CEI).
         tokShareOf[msg.sender] = bal - shares;
         tokShares -= shares;
-        _resetTokDebt(msg.sender);                    // rebase baseline to new count
+        _resetTokDebt(msg.sender); // rebase baseline to new count
         if (queued > 0) _queueTok(msg.sender, queued);
         if (paid > 0) engine.withdrawPlvTokenTo(paid, msg.sender);
         emit WithdrawTok(msg.sender, shares, paid, queued);
@@ -673,6 +698,7 @@ contract PerpVault is ReentrancyGuard {
     function pendingTok() public view returns (uint256) {
         return FullMath.mulDiv(tokQueueUnits, tokQueueIndex, QSCALE);
     }
+
     /// @notice `user`'s queued token exit, at the live index.
     function pendingTokOf(address user) public view returns (uint256) {
         if (_tokEpochOf[user] != tokQueueEpoch) return 0;
@@ -682,7 +708,10 @@ contract PerpVault is ReentrancyGuard {
     /// @dev Token twin of {_queueEth}.
     function _queueTok(address user, uint256 amount) private {
         uint256 u = FullMath.mulDiv(amount, QSCALE, tokQueueIndex);
-        if (_tokEpochOf[user] != tokQueueEpoch) { _tokEpochOf[user] = tokQueueEpoch; _tokUnitsOf[user] = 0; }
+        if (_tokEpochOf[user] != tokQueueEpoch) {
+            _tokEpochOf[user] = tokQueueEpoch;
+            _tokUnitsOf[user] = 0;
+        }
         _tokUnitsOf[user] += u;
         tokQueueUnits += u;
     }
@@ -708,7 +737,9 @@ contract PerpVault is ReentrancyGuard {
         if (newIdx == 0) {
             tokQueueUnits = 0;
             tokQueueIndex = QSCALE;
-            unchecked { tokQueueEpoch++; }
+            unchecked {
+                tokQueueEpoch++;
+            }
             emit QueueWrittenDown(true, claims, QSCALE);
             return;
         }
@@ -736,10 +767,17 @@ contract PerpVault is ReentrancyGuard {
         if (pendingTokOf(msg.sender) == 0) revert ZeroAmount();
         _syncTokQueue();
         uint256 owed = pendingTokOf(msg.sender);
-        if (owed == 0) { _dropTokUnits(msg.sender); emit ClaimTok(msg.sender, 0); return 0; }
+        if (owed == 0) {
+            _dropTokUnits(msg.sender);
+            emit ClaimTok(msg.sender, 0);
+            return 0;
+        }
         uint256 free = engine.freeToken();
         paid = owed <= free ? owed : free;
-        if (paid == 0) { emit ClaimTok(msg.sender, 0); return 0; }
+        if (paid == 0) {
+            emit ClaimTok(msg.sender, 0);
+            return 0;
+        }
         if (paid >= owed) {
             _dropTokUnits(msg.sender);
         } else {
@@ -764,6 +802,7 @@ contract PerpVault is ReentrancyGuard {
         instant = redeemable <= free ? redeemable : free;
         pending = pendingEthOf(user);
     }
+
     /// @notice Token currently redeemable for `user`'s shares + instant portion.
     function tokenPosition(address user) external view returns (uint256 redeemable, uint256 instant, uint256 pending) {
         uint256 s = tokShareOf[user];
@@ -772,6 +811,7 @@ contract PerpVault is ReentrancyGuard {
         instant = redeemable <= free ? redeemable : free;
         pending = pendingTokOf(user);
     }
+
     /// @notice A token staker's accrued short-side ETH reward, claimable now
     ///         (includes yield not yet folded into the accumulator).
     function pendingTokYield(address user) external view returns (uint256) {
@@ -781,8 +821,10 @@ contract PerpVault is ReentrancyGuard {
         uint256 cum = engine.tokYieldCumulative();
         uint256 pulled = totalTokYieldPulled;
         uint256 lost;
-        { uint256 backed = engine.tokYieldEth() + pulled;
-          lost = cum > backed ? cum - backed : 0; }
+        {
+            uint256 backed = engine.tokYieldEth() + pulled;
+            lost = cum > backed ? cum - backed : 0;
+        }
         uint256 last = lastTokYieldCum;
         uint256 shTot = tokShares;
         // Mirrors _syncTokYield exactly: at zero shares the delta is unattributed and
@@ -793,7 +835,7 @@ contract PerpVault is ReentrancyGuard {
         //  into the UI. Same detector, same split fold, same epoch line.
         if (cum != last) {
             if (shTot != 0) {
-                uint256 cut = pulled + lost;        // same clamp+split as _syncTokYield
+                uint256 cut = pulled + lost; // same clamp+split as _syncTokYield
                 if (cut < last) cut = last;
                 if (cut > cum) cut = cum;
                 if (lost != 0) {
@@ -807,14 +849,20 @@ contract PerpVault is ReentrancyGuard {
         } else if (lost != 0) {
             eAcc = acc;
         }
-        if (lost != 0) ep++;                       // the bump the next sync will make
+        if (lost != 0) ep++; // the bump the next sync will make
 
         uint256 sh = tokShareOf[user];
         uint256 owed = tokRewardOwed[user];
         uint256 debt = tokRewardDebt[user];
-        if (stakerEpoch[user] != ep) { owed = 0; debt = FullMath.mulDiv(sh, eAcc, ACC); }
+        if (stakerEpoch[user] != ep) {
+            owed = 0;
+            debt = FullMath.mulDiv(sh, eAcc, ACC);
+        }
         uint256 earned;
-        if (sh > 0) { uint256 a = FullMath.mulDiv(sh, acc, ACC); if (a > debt) earned = a - debt; }
+        if (sh > 0) {
+            uint256 a = FullMath.mulDiv(sh, acc, ACC);
+            if (a > debt) earned = a - debt;
+        }
         //  Internal units → today's quote, exactly as {claimTokYield} pays it.
         return FullMath.mulDiv(owed + earned, tokYieldScale, 1e18);
     }

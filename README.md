@@ -99,6 +99,18 @@ perps trade from the first block after the launch. Every later change is the tim
   closes before it, at the price before it moves (so a sale that would sink more than one transaction can liquidate
   is refused, like any trade: sell smaller).
 - Liquidity for perps is the community's: ETH stakers (longs borrow it), token stakers (shorts borrow it), in PerpVault.
+  The token stakers' ETH yield (20% of every short's fee) is indexed at 1e36 per share, so a minimum short's yield
+  reaches them to the wei however much is staked.
+- Trust notes. One open position, however small, keeps `lowerFee` and the engine's replacement waiting until it closes
+  or is liquidated: that refusal is the brief's, and a flat-price position has no clock on it, so the timelock has no
+  override. The `$IMD` burn's execution price is the keeper's (`burnImd(minImd)`: the keeper quotes the buy, 0.1 ETH
+  at most per Ethereum block); the keeper is the timelock's to name and replace, and the $IMD pool has no on-chain
+  reference price to bound it by. The sweep pays the keeper's cut to the EOA that sent the transaction (`tx.origin`),
+  not to the router or wallet contract that swapped. `setPerpEngine` makes whatever the timelock names the refunded
+  trader. A vault whose engine a fee move has unwired still takes deposits (idle, withdrawable in full at once).
+- The perps' code hashes (`ENGINE_CODE_HASH`, `VAULT_CODE_HASH`) are those of a clean full `forge build`
+  (`forge clean` first): via-IR's output for the engine depends on which files share its compile job, and an
+  incremental build after a partial one hashed differently. `script/launch.sh perps` builds clean.
 
 ## The liquidity: locked, its fees not
 
@@ -118,7 +130,7 @@ the opening buy's ETH or end the claims early: each visible 12h before it runs.
 ## Tests
 
 ```sh
-forge test                                         # 53 tests, offline: admission, the 0x6900 coin, launch, pool, fees, refunds, the fee's move (never with perps open), $IMD burn, claims, the ETH back; the perps (creation, code hash, longs, shorts, the sweep's liquidations, fees)
+forge test                                         # 69 tests, offline: admission, the 0x6900 coin, launch, pool, fees, refunds, the fee's move (never with perps open), $IMD burn, claims, the ETH back; the perps (creation, code hash, longs, shorts, the sweep's liquidations, fees, the stakers' yield to the wei)
 ROBINHOOD_RPC_URL=https://rpc.mainnet.chain.robinhood.com forge test --match-contract RobinhoodFork -vv
 ```
 

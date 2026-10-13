@@ -331,7 +331,9 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         emit Launched(t, sqrtPriceX96, pool.upperTick(), spend, bought, excess, excessTo);
     }
 
-    /// @notice After the claim deadline, the unclaimed reserve: burned (`to` zero) or sent to `to`. Once.
+    /// @notice After the claim deadline, the unclaimed reserve: burned (`to` zero), sent to `to`, or kept here for the
+    ///         timelock (`to` this contract: it joins the held coins, as {endClaims} and launch()'s `excessTo` book
+    ///         it, so {sellHeld} and {releaseExcess} can reach it instead of a self-transfer stranding it). Once.
     function releaseUnclaimed(address to) external onlyOwner nonReentrant {
         if (token == address(0)) revert NotLaunched();
         if (block.timestamp < claimDeadline) revert ClaimsOpen();
@@ -340,6 +342,7 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         unclaimedReleased = true;
         if (amount != 0) {
             if (to == address(0)) IMD6900(token).burn(amount);
+            else if (to == address(this)) excessHeld += amount;
             else SafeTransferLib.safeTransfer(token, to, amount);
         }
         emit UnclaimedReleased(to, amount);

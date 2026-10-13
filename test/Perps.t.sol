@@ -271,6 +271,31 @@ contract PerpsTest is Test {
         assertEq(POT.balance - potBefore, owed, "all of it, as ETH, to the pot bridge");
     }
 
+    /// The reviewer's medium finding: the vault's 1e18-scaled yield index over 1e6-offset shares floored a minimum
+    /// short's LP share of the fee to a few steps (or to nothing, with a large stake) and orphaned the rest in the
+    /// engine's pot. Now the token stakers can claim a minimum short's yield to the wei.
+    function test_AMinimumShortsFeeReachesTheTokenStakers() public {
+        Trader buyer = new Trader(PM);
+        vm.deal(address(buyer), 3 ether);
+        buyer.swap(k, true, -2 ether);
+        uint256 coins = IERC20Min(t).balanceOf(address(buyer));
+        vm.prank(address(buyer));
+        IERC20Min(t).approve(address(vault), coins);
+        vm.prank(address(buyer));
+        vault.depositToken(coins);
+        uint256 potBefore = engine.tokYieldEth();
+        vm.prank(ALICE);
+        engine.openShort{value: 0.0108 ether}(2, 0); // the minimum: 0.01 ETH of collateral after the 6.9% fee
+        uint256 yield = engine.tokYieldEth() - potBefore;
+        assertApproxEqRel(yield, 0.0108 ether * 690 / 10_000 * 2 / 10, 1e15, "20% of the open fee to the stakers");
+        uint256 pending = vault.pendingTokYield(address(buyer));
+        emit log_named_uint("a minimum short's yield (wei)", yield);
+        emit log_named_uint("what the stakers can claim of it (wei)", pending);
+        assertGe(pending, yield - 1, "all of it, to the wei: nothing orphaned in the pot");
+        vm.prank(address(buyer));
+        assertEq(vault.claimTokYield(), pending);
+    }
+
     function test_TheEngineCantBeUnwiredWithPositionsOpen() public {
         vm.prank(ALICE);
         engine.openLong{value: 0.1 ether}(5, 0);

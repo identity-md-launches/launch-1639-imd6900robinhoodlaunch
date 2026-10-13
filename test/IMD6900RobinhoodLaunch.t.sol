@@ -873,6 +873,32 @@ contract IMD6900RobinhoodLaunchTest is Test {
         vm.stopPrank();
     }
 
+    /// The reviewer's low finding: releasing the unclaimed reserve to the launch itself was a self-transfer that
+    /// booked nothing, leaving the coins where no function could reach them. Now it joins the coins held for the
+    /// timelock, as launch()'s excessTo and endClaims book it.
+    function test_TheUnclaimedRestKeptHereIsTheTimelocksToSell() public {
+        (address t,) = _launchHeld();
+        vm.startPrank(C);
+        imdstr.approve(address(L), CC);
+        L.claim(CC, CC, _proof(2));
+        vm.stopPrank();
+        vm.warp(block.timestamp + 101 days);
+        uint256 held = L.excessHeld();
+        uint256 balance = IERC20(t).balanceOf(address(L));
+        vm.prank(OWNER);
+        L.releaseUnclaimed(address(L));
+        assertEq(L.claimReserve(), 0);
+        assertEq(L.excessHeld(), held + AA + BB, "the unclaimed reserve joins the held coins");
+        assertEq(IERC20(t).balanceOf(address(L)), balance, "nothing moved");
+        assertEq(L.excessHeld(), balance, "everything here is the timelock's to sell");
+        vm.prank(TL);
+        vm.expectRevert(IMD6900RobinhoodLaunch.AlreadyReleased.selector);
+        L.endClaims();
+        vm.prank(TL);
+        L.sellHeld(0, 0, R);
+        assertLt(IERC20(t).balanceOf(address(L)), 20_000 ether, "sold back, to the refund's dust");
+    }
+
     /*                        THE OPENING BUY'S ETH, BACK                     */
 
     function test_TheTimelockSellsTheExcessBack() public {

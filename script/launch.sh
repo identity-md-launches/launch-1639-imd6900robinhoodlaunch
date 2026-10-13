@@ -205,7 +205,9 @@ import json; d=json.load(open('review.json')); print(json.dumps({k: d.get(k) for
     P=$(c $LAUNCH 'pool()(address)')
     E=$(c $P 'perpsEngine()(address)')
     [ "$E" = 0x0000000000000000000000000000000000000000 ] || { echo "perps: engine $E, vault $(c $P 'perpsVault()(address)')"; exit 0; }
-    forge build --silent
+    # a clean build: via-IR's output for the engine depends on which files are in the compile job (an incremental build
+    # after a partial one hashed differently), and the pool's constants are the clean full build's
+    forge clean && forge build --silent
     EC=$(python3 -c "import json;print(json.load(open('out/PerpEngine.sol/PerpEngine.json'))['bytecode']['object'])")
     VC=$(python3 -c "import json;print(json.load(open('out/PerpVault.sol/PerpVault.json'))['bytecode']['object'])")
     [ "$(cast keccak $EC)" = "$(c $P 'ENGINE_CODE_HASH()(bytes32)')" ] && [ "$(cast keccak $VC)" = "$(c $P 'VAULT_CODE_HASH()(bytes32)')" ] \
