@@ -32,11 +32,28 @@ contract MockImdstr {
     uint256 public totalSupply;
     mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
-    function mint(address to, uint256 a) external { balanceOf[to] += a; totalSupply += a; }
-    function approve(address s, uint256 a) external returns (bool) { allowance[msg.sender][s] = a; return true; }
-    function transfer(address to, uint256 a) external returns (bool) { balanceOf[msg.sender] -= a; balanceOf[to] += a; return true; }
+
+    function mint(address to, uint256 a) external {
+        balanceOf[to] += a;
+        totalSupply += a;
+    }
+
+    function approve(address s, uint256 a) external returns (bool) {
+        allowance[msg.sender][s] = a;
+        return true;
+    }
+
+    function transfer(address to, uint256 a) external returns (bool) {
+        balanceOf[msg.sender] -= a;
+        balanceOf[to] += a;
+        return true;
+    }
+
     function transferFrom(address f, address to, uint256 a) external returns (bool) {
-        allowance[f][msg.sender] -= a; balanceOf[f] -= a; balanceOf[to] += a; return true;
+        allowance[f][msg.sender] -= a;
+        balanceOf[f] -= a;
+        balanceOf[to] += a;
+        return true;
     }
 }
 
@@ -44,23 +61,37 @@ contract MockImdstr {
 contract Trader {
     IPoolManager immutable pm;
     PoolKey key;
-    constructor(IPoolManager pm_) { pm = pm_; }
+
+    constructor(IPoolManager pm_) {
+        pm = pm_;
+    }
+
     function swap(PoolKey calldata k, bool buy, int256 amountSpecified) external payable returns (BalanceDelta d) {
         key = k;
         d = abi.decode(pm.unlock(abi.encode(buy, amountSpecified)), (BalanceDelta));
     }
+
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
         (bool buy, int256 amt) = abi.decode(data, (bool, int256));
-        BalanceDelta d = pm.swap(key, SwapParams(buy, amt, buy ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1), "");
+        BalanceDelta d =
+            pm.swap(key, SwapParams(buy, amt, buy ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1), "");
         _settle(key.currency0, d.amount0());
         _settle(key.currency1, d.amount1());
         return abi.encode(d);
     }
+
     function _settle(Currency c, int128 v) internal {
         if (v < 0) {
-            if (c.isAddressZero()) pm.settle{value: uint128(-v)}();
-            else { pm.sync(c); IERC20(Currency.unwrap(c)).transfer(address(pm), uint128(-v)); pm.settle(); }
-        } else if (v > 0) pm.take(c, address(this), uint128(v));
+            if (c.isAddressZero()) {
+                pm.settle{value: uint128(-v)}();
+            } else {
+                pm.sync(c);
+                IERC20(Currency.unwrap(c)).transfer(address(pm), uint128(-v));
+                pm.settle();
+            }
+        } else if (v > 0) {
+            pm.take(c, address(this), uint128(v));
+        }
     }
     receive() external payable {}
 }
@@ -68,15 +99,27 @@ contract Trader {
 /// A stand-in perps engine: trades like any router, and its sweep finds nothing to liquidate
 contract Engine is Trader {
     constructor(IPoolManager pm_) Trader(pm_) {}
-    function sweepLiquidations(address, int256, bool, uint160) external pure returns (uint8) { return 0; }
-    function openCount() external pure returns (uint256) { return 0; }
+
+    function sweepLiquidations(address, int256, bool, uint160) external pure returns (uint8) {
+        return 0;
+    }
+
+    function openCount() external pure returns (uint256) {
+        return 0;
+    }
 }
 
 /// A payee that refuses ETH until told otherwise
 contract Refuser {
     bool public open;
-    function setOpen(bool o) external { open = o; }
-    receive() external payable { require(open, "no"); }
+
+    function setOpen(bool o) external {
+        open = o;
+    }
+
+    receive() external payable {
+        require(open, "no");
+    }
 }
 
 /// A perps engine that takes its fee back the way PerpSwapLib.swapLeg does: checkpoint, swap, refund, in its unlock
@@ -84,17 +127,29 @@ contract RefundingEngine {
     IPoolManager immutable pm;
     IMD6900LockedPool immutable lp;
     PoolKey key;
-    constructor(IPoolManager pm_, IMD6900LockedPool lp_) { (pm, lp) = (pm_, lp_); }
-    function sweepLiquidations(address, int256, bool, uint160) external pure returns (uint8) { return 0; }
-    function openCount() external pure returns (uint256) { return 0; }
+
+    constructor(IPoolManager pm_, IMD6900LockedPool lp_) {
+        (pm, lp) = (pm_, lp_);
+    }
+
+    function sweepLiquidations(address, int256, bool, uint160) external pure returns (uint8) {
+        return 0;
+    }
+
+    function openCount() external pure returns (uint256) {
+        return 0;
+    }
+
     function swap(PoolKey calldata k, bool buy, int256 amt) external returns (uint256 r0, uint256 r1) {
         key = k;
         (r0, r1) = abi.decode(pm.unlock(abi.encode(buy, amt)), (uint256, uint256));
     }
+
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
         (bool buy, int256 amt) = abi.decode(data, (bool, int256));
         lp.feeCheckpoint();
-        BalanceDelta d = pm.swap(key, SwapParams(buy, amt, buy ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1), "");
+        BalanceDelta d =
+            pm.swap(key, SwapParams(buy, amt, buy ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1), "");
         (uint256 r0, uint256 r1) = lp.feeRefund(address(this));
         if (buy) {
             pm.settle{value: uint128(-d.amount0())}();
@@ -114,18 +169,43 @@ contract RefundingEngine {
 contract CountingEngine {
     uint256 public openCount;
     bool public broken;
-    function set(uint256 n, bool b) external { (openCount, broken) = (n, b); }
-    function sweepLiquidations(address, int256, bool, uint160) external pure returns (uint8) { return 0; }
-    fallback() external { revert(); }
+
+    function set(uint256 n, bool b) external {
+        (openCount, broken) = (n, b);
+    }
+
+    function sweepLiquidations(address, int256, bool, uint160) external pure returns (uint8) {
+        return 0;
+    }
+
+    fallback() external {
+        revert();
+    }
 }
 
 /// Puts full-range liquidity in a plain pool (the stand-in for $IMD's pool on Robinhood)
 contract LiquidityAdder {
-    IPoolManager immutable pm; PoolKey key; uint256 liq;
-    constructor(IPoolManager pm_) { pm = pm_; }
-    function add(PoolKey calldata k, uint256 l) external { (key, liq) = (k, l); pm.unlock(""); }
+    IPoolManager immutable pm;
+    PoolKey key;
+    uint256 liq;
+
+    constructor(IPoolManager pm_) {
+        pm = pm_;
+    }
+
+    function add(PoolKey calldata k, uint256 l) external {
+        (key, liq) = (k, l);
+        pm.unlock("");
+    }
+
     function unlockCallback(bytes calldata) external returns (bytes memory) {
-        (BalanceDelta d,) = pm.modifyLiquidity(key, ModifyLiquidityParams(TickMath.minUsableTick(key.tickSpacing), TickMath.maxUsableTick(key.tickSpacing), int256(liq), 0), "");
+        (BalanceDelta d,) = pm.modifyLiquidity(
+            key,
+            ModifyLiquidityParams(
+                TickMath.minUsableTick(key.tickSpacing), TickMath.maxUsableTick(key.tickSpacing), int256(liq), 0
+            ),
+            ""
+        );
         pm.settle{value: uint128(-d.amount0())}();
         pm.sync(key.currency1);
         IERC20(Currency.unwrap(key.currency1)).transfer(address(pm), uint128(-d.amount1()));
@@ -137,12 +217,21 @@ contract LiquidityAdder {
 
 /// Someone who isn't the locked pool, trying to put liquidity next to it, or to change it
 contract Squatter {
-    IPoolManager immutable pm; PoolKey key; int24 lo; int24 hi; int256 delta;
-    constructor(IPoolManager pm_) { pm = pm_; }
+    IPoolManager immutable pm;
+    PoolKey key;
+    int24 lo;
+    int24 hi;
+    int256 delta;
+
+    constructor(IPoolManager pm_) {
+        pm = pm_;
+    }
+
     function modify(PoolKey calldata k, int24 lo_, int24 hi_, int256 delta_) external {
         (key, lo, hi, delta) = (k, lo_, hi_, delta_);
         pm.unlock("");
     }
+
     function unlockCallback(bytes calldata) external returns (bytes memory) {
         pm.modifyLiquidity(key, ModifyLiquidityParams(lo, hi, delta, 0), "");
         return "";
@@ -185,10 +274,14 @@ contract IMD6900RobinhoodLaunchTest is Test {
         hook = L.createHook(HookSalt.mine(L));
         pool = L.pool();
         SALT = CoinSalt.mine(L); // the coin's 0x6900 salt, as script/mine.sh finds it
-        imdstr.mint(A, AA); imdstr.mint(B, BB); imdstr.mint(C, CC);
+        imdstr.mint(A, AA);
+        imdstr.mint(B, BB);
+        imdstr.mint(C, CC);
         trader = new Trader(PM);
         vm.deal(address(trader), 100 ether);
-        leaves.push(_leaf(A, AA)); leaves.push(_leaf(B, BB)); leaves.push(_leaf(C, CC));
+        leaves.push(_leaf(A, AA));
+        leaves.push(_leaf(B, BB));
+        leaves.push(_leaf(C, CC));
     }
 
     /*                                ADMISSION                              */
@@ -230,7 +323,10 @@ contract IMD6900RobinhoodLaunchTest is Test {
         assertEq(uint160(address(hook)) & Hooks.ALL_HOOK_MASK, L.FLAGS(), "carries exactly its flags");
         assertTrue(uint160(address(hook)) >> 152 != 0x91, "not a 0x91 address");
         Hooks.Permissions memory p = hook.getHookPermissions();
-        assertFalse(p.beforeSwapReturnDelta || p.afterSwapReturnDelta || p.afterAddLiquidityReturnDelta || p.afterRemoveLiquidityReturnDelta);
+        assertFalse(
+            p.beforeSwapReturnDelta || p.afterSwapReturnDelta || p.afterAddLiquidityReturnDelta
+                || p.afterRemoveLiquidityReturnDelta
+        );
     }
 
     function test_EachDeployerMinesItsOwnHook() public {
@@ -440,7 +536,9 @@ contract IMD6900RobinhoodLaunchTest is Test {
         uint256 toPot = POT.balance - potBefore;
         emit log_named_decimal_uint("pot bridge", toPot, 18);
         uint256 fees = toPot + L.imdBucket();
-        assertApproxEqRel(fees, (10 ether + BUY) * 444 / 10_000, 0.001e18, "4.44% of the buys, the opening buy's included");
+        assertApproxEqRel(
+            fees, (10 ether + BUY) * 444 / 10_000, 0.001e18, "4.44% of the buys, the opening buy's included"
+        );
         assertApproxEqRel(toPot, fees * 9 / 10, 1e14, "90% the NFT floor pot");
         assertApproxEqRel(L.imdBucket(), fees / 10, 1e14, "10% set aside for $IMD's canonical burn");
         assertEq(OWNER.balance, ownerBefore, "nothing to the team");
@@ -498,7 +596,9 @@ contract IMD6900RobinhoodLaunchTest is Test {
         L.split();
         assertEq(L.owed(address(r)), 0.9 ether, "the refused 90% is booked to it");
         assertEq(L.imdBucket(), 0.1 ether);
-        for (uint256 i; i < 5; ++i) L.split(); // before the fix every call re-split it: 10% more to $IMD each time
+        for (uint256 i; i < 5; ++i) {
+            L.split(); // before the fix every call re-split it: 10% more to $IMD each time
+        }
         assertEq(L.imdBucket(), 0.1 ether, "no drift into the $IMD bucket");
         assertEq(L.owed(address(r)), 0.9 ether);
         r.setOpen(true);
@@ -555,7 +655,9 @@ contract IMD6900RobinhoodLaunchTest is Test {
         assertEq(bps[1], 1_000, "10% $IMD's canonical burn");
         trader.swap(k, true, -1 ether);
         (uint256 eth,) = pool.collect();
-        assertApproxEqRel(eth, (1 ether + BUY) * 444 / 10_000, 0.001e18, "4.44% of the buys, the opening buy's included");
+        assertApproxEqRel(
+            eth, (1 ether + BUY) * 444 / 10_000, 0.001e18, "4.44% of the buys, the opening buy's included"
+        );
     }
 
     function test_LowerFeeMovesTheLiquidity() public {
@@ -576,7 +678,12 @@ contract IMD6900RobinhoodLaunchTest is Test {
         assertApproxEqRel(l1, l0, 1e9, "all of the liquidity moved (to the wei of rounding)");
         assertEq(inPool, l1, "and it is all the new pool has");
         assertEq(PM.getLiquidity(old.toId()), 0, "the old pool is empty");
-        assertApproxEqRel(address(L).balance - lBefore, (5 ether + BUY) * 444 / 10_000, 0.001e18, "only the old pool's earned fees came out");
+        assertApproxEqRel(
+            address(L).balance - lBefore,
+            (5 ether + BUY) * 444 / 10_000,
+            0.001e18,
+            "only the old pool's earned fees came out"
+        );
         assertLe(IERC20(t).totalSupply(), supply, "its IMD6900 fees burned");
         // trading goes on in the new pool, at the new fee; the old one is closed
         trader.swap(neu, true, -1 ether);
@@ -697,7 +804,9 @@ contract IMD6900RobinhoodLaunchTest is Test {
         engine.swap(pool.poolKey(), true, -1 ether); // its own trade: no sweep
         trader.swap(pool.poolKey(), true, -1 ether); // a trader's: the engine's (empty) sweep runs first
         (uint256 eth,) = pool.collect();
-        assertApproxEqRel(eth, (2 ether + BUY) * 444 / 10_000, 0.001e18, "both pay the pool's fee, into the protocol's own position");
+        assertApproxEqRel(
+            eth, (2 ether + BUY) * 444 / 10_000, 0.001e18, "both pay the pool's fee, into the protocol's own position"
+        );
     }
 
     function test_OnlyTheTimelockRepointsImdsPool() public {
@@ -833,7 +942,9 @@ contract IMD6900RobinhoodLaunchTest is Test {
         L.sellHeld(0, 0, R);
         L.harvest();
         emit log_named_decimal_uint("back of the 2.81 ETH buy, nobody claimed", R.balance, 18);
-        assertGe(R.balance, BUY * 99 / 100, "all of it: the sale is fee-free, the buy's fee comes back through the split");
+        assertGe(
+            R.balance, BUY * 99 / 100, "all of it: the sale is fee-free, the buy's fee comes back through the split"
+        );
         assertLt(IERC20(t).balanceOf(address(L)), 20_000 ether, "dust of the last round's refund");
     }
 
@@ -869,6 +980,47 @@ contract IMD6900RobinhoodLaunchTest is Test {
         assertEq(L.imdBurn(), R);
         (address[] memory to,) = L.payees();
         assertEq(to[1], R, "the default split follows it");
+    }
+
+    /// The audit's low finding: a payee that refused its share and then became the burn executor kept its owed ETH
+    /// reserved out of every split for good (split skips the executor before the owed bookkeeping). Repointing the
+    /// executor now cancels what it was owed, as setPayees cancels a dropped payee's: the next split divides it again.
+    function test_RepointingTheBurnExecutorCancelsWhatItWasOwed() public {
+        _launch();
+        Refuser r = new Refuser();
+        address[] memory to = new address[](2);
+        uint16[] memory bps = new uint16[](2);
+        (to[0], bps[0], to[1], bps[1]) = (address(r), 5_000, POT, 5_000);
+        vm.prank(TL);
+        L.setPayees(to, bps);
+        vm.deal(address(L), 1 ether);
+        L.split();
+        assertEq(L.owed(address(r)), 0.5 ether);
+        assertEq(L.owedTotal(), 0.5 ether);
+        vm.prank(TL);
+        L.setImdBurn(address(r));
+        assertEq(L.owed(address(r)), 0, "cancelled");
+        assertEq(L.owedTotal(), 0);
+        uint256 potBefore = POT.balance;
+        L.split(); // the 0.5 ETH again: half to the executor's $IMD bucket, half to the pot
+        assertEq(L.imdBucket(), 0.25 ether);
+        assertEq(POT.balance - potBefore, 0.25 ether);
+        assertEq(address(L).balance, 0.25 ether, "nothing left reserved out of the split");
+    }
+
+    /// The hook's refund flag is set with the engine it describes: a replacement starts not refunded
+    function test_AReplacementEngineStartsNotRefunded() public {
+        _launch();
+        vm.prank(TL);
+        hook.setPerpRefunded(true);
+        RefundingEngine engine = new RefundingEngine(PM, pool);
+        vm.prank(TL);
+        hook.setPerpEngine(address(engine));
+        assertFalse(hook.perpRefunded(), "reset with the engine");
+        assertEq(hook.perpFeeBps(), 444);
+        vm.prank(TL);
+        hook.setPerpRefunded(true);
+        assertEq(hook.perpFeeBps(), 0);
     }
 
     /*                         OWNER AND TIMELOCK                           */
@@ -982,7 +1134,14 @@ contract IMD6900RobinhoodLaunchTest is Test {
     /// @dev The launch from its build artifact (as deployed), rather than `new`: a test contract that embeds the
     ///      launch's creation code (with the pool's and the hook's inside it) costs the swarm's build machine too much.
     ///      The PoolManager, which no import of ours would otherwise put in a proof's build, stays a `new`.
-    function _newLaunch(address owner_, IPoolManager pm, address imdstr_, address tl) internal returns (IMD6900RobinhoodLaunch) {
-        return IMD6900RobinhoodLaunch(payable(vm.deployCode("IMD6900RobinhoodLaunch.sol:IMD6900RobinhoodLaunch", abi.encode(owner_, pm, imdstr_, tl))));
+    function _newLaunch(address owner_, IPoolManager pm, address imdstr_, address tl)
+        internal
+        returns (IMD6900RobinhoodLaunch)
+    {
+        return IMD6900RobinhoodLaunch(
+            payable(vm.deployCode(
+                    "IMD6900RobinhoodLaunch.sol:IMD6900RobinhoodLaunch", abi.encode(owner_, pm, imdstr_, tl)
+                ))
+        );
     }
 }

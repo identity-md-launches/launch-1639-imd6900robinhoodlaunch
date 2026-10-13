@@ -13,9 +13,10 @@ library HookSalt {
 
     function mine(IMD6900RobinhoodLaunch l, uint256 from) internal view returns (bytes32 s) {
         bytes32 initHash = l.hookInitCodeHash();
+        address deployer = address(l.pool());
         uint160 flags = l.FLAGS();
         for (uint256 i = from;; ++i) {
-            address a = address(uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(l.pool()), i, initHash)))));
+            address a = Create2Address.compute(deployer, bytes32(i), initHash);
             if (uint160(a) & Hooks.ALL_HOOK_MASK == flags && uint160(a) >> 152 != 0x91) return bytes32(i);
         }
     }
@@ -28,8 +29,23 @@ library CoinSalt {
         bytes32 initHash = l.tokenInitCodeHash();
         uint160 vanity = l.VANITY();
         for (uint256 i;; ++i) {
-            address a = address(uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(l), i, initHash)))));
+            address a = Create2Address.compute(address(l), bytes32(i), initHash);
             if (uint160(a) >> 144 == vanity) return bytes32(i);
+        }
+    }
+}
+
+/// @dev The CREATE2 address, hashed in place (no allocation per try: a long search allocating each try runs out of
+///      memory before it runs out of gas)
+library Create2Address {
+    function compute(address deployer, bytes32 salt, bytes32 initHash) internal pure returns (address a) {
+        assembly ("memory-safe") {
+            let p := mload(0x40) // temporary, beyond the free memory pointer, never persisted
+            mstore8(p, 0xff)
+            mstore(add(p, 0x01), shl(96, deployer))
+            mstore(add(p, 0x15), salt)
+            mstore(add(p, 0x35), initHash)
+            a := and(keccak256(p, 0x55), 0xffffffffffffffffffffffffffffffffffffffff)
         }
     }
 }

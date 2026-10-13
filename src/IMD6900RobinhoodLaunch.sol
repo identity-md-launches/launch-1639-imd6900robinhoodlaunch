@@ -127,7 +127,15 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     event HookCreated(address hook, bytes32 salt);
     event ClaimsSet(bytes32 root, uint256 total, uint256 deadline);
     event EthWithdrawn(address to, uint256 amount);
-    event Launched(address token, uint160 sqrtPriceX96, int24 upperTick, uint256 ethSpent, uint256 bought, uint256 excess, address excessTo);
+    event Launched(
+        address token,
+        uint160 sqrtPriceX96,
+        int24 upperTick,
+        uint256 ethSpent,
+        uint256 bought,
+        uint256 excess,
+        address excessTo
+    );
     event Claimed(address indexed account, uint256 amount);
     event UnclaimedReleased(address to, uint256 amount);
     event ImdstrReleased(address to, uint256 amount);
@@ -221,7 +229,10 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     function tokenAddress(bytes32 salt) public view returns (address) {
         bytes32 h = keccak256(
             abi.encodePacked(
-                bytes1(0xff), address(this), salt, keccak256(abi.encodePacked(type(IMD6900).creationCode, abi.encode(address(this))))
+                bytes1(0xff),
+                address(this),
+                salt,
+                keccak256(abi.encodePacked(type(IMD6900).creationCode, abi.encode(address(this))))
             )
         );
         return address(uint160(uint256(h)));
@@ -240,7 +251,9 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
             return (to, bps);
         }
         (to, bps) = (new address[](n), new uint16[](n));
-        for (uint256 i; i < n; ++i) (to[i], bps[i]) = (_payees[i], _shares[i]);
+        for (uint256 i; i < n; ++i) {
+            (to[i], bps[i]) = (_payees[i], _shares[i]);
+        }
     }
 
     /// @notice The owner can't be renounced: the claims, the launch and the $IMD buys need one
@@ -434,10 +447,19 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         emit HeldSold(sold, eth, to);
     }
 
-    /// @notice Repoints the $IMD share to another burn executor (set the payees again if they name the old one)
+    /// @notice Repoints the $IMD share to another burn executor (set the payees again if they name the old one). What
+    ///         was booked to the new executor as a payee that refused its share ({owed}) is cancelled, as {setPayees}
+    ///         cancels a dropped payee's: the executor's share is set aside for {burnImd}, never sent, so {split} would
+    ///         never offer it again and that ETH would sit here out of every split.
     function setImdBurn(address executor) external {
         if (msg.sender != timelock) revert NotTimelock();
         if (executor == address(0)) revert BadPayees();
+        uint256 due = owed(executor);
+        if (due != 0) {
+            owedTotal -= due;
+            _owed[_owedEpoch][executor] = 0;
+            emit OwedCancelled(due);
+        }
         imdBurn = executor;
         emit ImdBurnSet(executor);
     }
@@ -518,7 +540,9 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     /// @notice Buys $IMD with what is set aside for its burn, one buy of at most {IMD_BUY_MAX} per block, and sends it
     ///         to IMD's burn executor (anyone can then bridge it to Base, where it is destroyed). The keeper only
     ///         ({imdKeeper}, the owner by default): it quotes the buy and passes the floor, the buy's price protection.
-    ///         An incomplete fill reverts, keeping the unspent ETH reserved for the burn.
+    ///         An incomplete fill reverts, keeping the unspent ETH reserved for the burn. The block is block.number,
+    ///         which on Robinhood Chain (Arbitrum Orbit) is Ethereum's: one buy per L1 block (~12s), the stricter
+    ///         throttle, on purpose.
     /// @param minImd the least $IMD the buy may return
     function burnImd(uint256 minImd) external nonReentrant returns (uint256 imd) {
         address keeper = imdKeeper;
@@ -536,7 +560,8 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     }
 
     function imdPoolKey() public view returns (PoolKey memory) {
-        return PoolKey(Currency.wrap(address(0)), Currency.wrap(IMD), imdPoolFee, imdPoolTickSpacing, IHooks(imdPoolHooks));
+        return
+            PoolKey(Currency.wrap(address(0)), Currency.wrap(IMD), imdPoolFee, imdPoolTickSpacing, IHooks(imdPoolHooks));
     }
 
     /// @notice Collects the pool's fees (its IMD6900 burned, its ETH here) and splits the ETH

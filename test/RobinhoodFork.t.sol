@@ -44,23 +44,37 @@ struct ExactInputSingleParams {
 contract ForkTrader {
     IPoolManager immutable pm;
     PoolKey key;
-    constructor(IPoolManager pm_) { pm = pm_; }
+
+    constructor(IPoolManager pm_) {
+        pm = pm_;
+    }
+
     function swap(PoolKey calldata k, bool buy, int256 amountSpecified) external payable returns (BalanceDelta d) {
         key = k;
         d = abi.decode(pm.unlock(abi.encode(buy, amountSpecified)), (BalanceDelta));
     }
+
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
         (bool buy, int256 amt) = abi.decode(data, (bool, int256));
-        BalanceDelta d = pm.swap(key, SwapParams(buy, amt, buy ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1), "");
+        BalanceDelta d =
+            pm.swap(key, SwapParams(buy, amt, buy ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1), "");
         _settle(key.currency0, d.amount0());
         _settle(key.currency1, d.amount1());
         return abi.encode(d);
     }
+
     function _settle(Currency c, int128 v) internal {
         if (v < 0) {
-            if (c.isAddressZero()) pm.settle{value: uint128(-v)}();
-            else { pm.sync(c); IERC20(Currency.unwrap(c)).transfer(address(pm), uint128(-v)); pm.settle(); }
-        } else if (v > 0) pm.take(c, address(this), uint128(v));
+            if (c.isAddressZero()) {
+                pm.settle{value: uint128(-v)}();
+            } else {
+                pm.sync(c);
+                IERC20(Currency.unwrap(c)).transfer(address(pm), uint128(-v));
+                pm.settle();
+            }
+        } else if (v > 0) {
+            pm.take(c, address(this), uint128(v));
+        }
     }
     receive() external payable {}
 }
@@ -109,15 +123,19 @@ contract RobinhoodForkTest is Test {
         vm.deal(TEAM, 2.81 ether);
         bytes32 salt = CoinSalt.mine(L); // 0x6900, as script/mine.sh finds it
         address expected = L.tokenAddress(salt);
-        uint160 sp = uint160(_sqrt(FullMath.mulDiv(SUPPLY, 1 << 192, 19.40 ether)));
+        uint160 sp = uint160(_sqrt(FullMath.mulDiv(SUPPLY, 1 << 192, 19.4 ether)));
         vm.prank(TEAM);
         (address t, uint256 bought) = L.launch{value: 2.81 ether}(salt, expected, sp, 0, address(L)); // as launch.sh: the excess kept
         emit log_named_decimal_uint("opening buy, coins", bought, 18);
         IMD6900LockedPool pool = L.pool();
         uint128 locked = pool.liquidity();
         (uint160 sq,,) = pool.state();
-        emit log_named_decimal_uint("market cap after it, ETH on 1B", FullMath.mulDiv(FullMath.mulDiv(SUPPLY, 1 << 96, sq), 1 << 96, sq), 18);
-        assertEq(IERC20(t).balanceOf(address(L)), b1 + b2 + L.excessHeld(), "the claims' reserve and the excess, both here");
+        emit log_named_decimal_uint(
+            "market cap after it, ETH on 1B", FullMath.mulDiv(FullMath.mulDiv(SUPPLY, 1 << 96, sq), 1 << 96, sq), 18
+        );
+        assertEq(
+            IERC20(t).balanceOf(address(L)), b1 + b2 + L.excessHeld(), "the claims' reserve and the excess, both here"
+        );
 
         // claims open with the timelock's op, as on the day
         vm.prank(TL);
@@ -180,7 +198,9 @@ contract RobinhoodForkTest is Test {
         uint256 id = engine.openLong{value: 0.05 ether}(5, 0);
         vm.prank(alice);
         engine.close(id, 0);
-        emit log_named_decimal_uint("a 0.05 ETH 5x long, opened and closed on live state: back", alice.balance - 0.95 ether, 18);
+        emit log_named_decimal_uint(
+            "a 0.05 ETH 5x long, opened and closed on live state: back", alice.balance - 0.95 ether, 18
+        );
         assertGe(alice.balance - 0.95 ether, 0.046 ether, "the collateral less the 6.9% open fee: no pool fee");
         assertEq(engine.openCount(), 0);
         uint256 potPerps = POT.balance;
@@ -201,12 +221,26 @@ contract RobinhoodForkTest is Test {
         assertEq(PM.getLiquidity(k.toId()), 0, "the 4.44% pool is empty");
         uint256 before2 = IERC20(t).balanceOf(buyer);
         _routerBuy(buyer, k2, 0.5 ether);
-        emit log_named_decimal_uint("bought through the Universal Router at 3.33%", IERC20(t).balanceOf(buyer) - before2, 18);
+        emit log_named_decimal_uint(
+            "bought through the Universal Router at 3.33%", IERC20(t).balanceOf(buyer) - before2, 18
+        );
         assertGt(IERC20(t).balanceOf(buyer), before2, "Uniswap's router trades the new pool");
         vm.expectRevert();
         tr.swap(k, true, -0.1 ether);
         L.harvest();
         assertGt(POT.balance, potBefore2, "the new pool's fees reach the pot");
+        // the perps again, on the 3.33% pool: the old engine is bound to the pool left behind, so the same call makes
+        // a fresh pair from the same audited code and the hook serves it at once
+        (address e2, address v2) = pool.createPerps(_engineCode(), _vaultCode());
+        assertEq(L.hook().perpEngine(), e2, "the perps live on the new pool");
+        assertTrue(L.hook().perpRefunded());
+        vm.prank(address(0x57A4E));
+        PerpVault(payable(v2)).depositEth{value: 1 ether}();
+        vm.prank(alice);
+        id = PerpEngine(payable(e2)).openLong{value: 0.05 ether}(5, 0);
+        vm.prank(alice);
+        PerpEngine(payable(e2)).close(id, 0);
+        assertEq(PerpEngine(payable(e2)).openCount(), 0);
 
         // and the opening buy's ETH back, if the team wants it: the timelock ends the claims (H2 never claimed) and
         // sells everything the launch holds back into the pool (after the trades above moved the price)
@@ -242,8 +276,15 @@ contract RobinhoodForkTest is Test {
 
     /// @dev The launch from its build artifact (as deployed), rather than `new`: a test contract that embeds the
     ///      launch's creation code (and the PoolManager's, and the perps') costs the swarm's build machine too much
-    function _newLaunch(address owner_, IPoolManager pm, address imdstr_, address tl) internal returns (IMD6900RobinhoodLaunch) {
-        return IMD6900RobinhoodLaunch(payable(vm.deployCode("IMD6900RobinhoodLaunch.sol:IMD6900RobinhoodLaunch", abi.encode(owner_, pm, imdstr_, tl))));
+    function _newLaunch(address owner_, IPoolManager pm, address imdstr_, address tl)
+        internal
+        returns (IMD6900RobinhoodLaunch)
+    {
+        return IMD6900RobinhoodLaunch(
+            payable(vm.deployCode(
+                    "IMD6900RobinhoodLaunch.sol:IMD6900RobinhoodLaunch", abi.encode(owner_, pm, imdstr_, tl)
+                ))
+        );
     }
 
     function _engineCode() internal view returns (bytes memory) {

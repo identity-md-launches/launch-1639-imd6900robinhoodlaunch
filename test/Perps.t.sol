@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, Vm} from "forge-std/Test.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {PoolManager} from "@uniswap/v4-core/src/PoolManager.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
@@ -46,8 +46,7 @@ contract PerpsTest is Test {
         (L, hook, pool) = _deploy();
         t = _launch(L);
         vm.deal(address(this), 1 ether);
-        (address e, address v) =
-            pool.createPerps{value: 0.05 ether}(_engineCode(), _vaultCode());
+        (address e, address v) = pool.createPerps{value: 0.05 ether}(_engineCode(), _vaultCode());
         (engine, vault) = (PerpEngine(payable(e)), PerpVault(payable(v)));
         k = pool.poolKey();
         vm.deal(STAKER, 20 ether);
@@ -152,6 +151,116 @@ contract PerpsTest is Test {
         assertGt(tx.origin.balance, keeper, "the keeper's cut to whoever sent the swap");
     }
 
+    /// The audit's medium finding: the timelock's fee-free sale of the held coins skipped the hook's pre-trade sweep,
+    /// so a long it sank was liquidated only by the next trade, at the price the sale left (bad debt on the stakers).
+    /// Now the sale gets the pre-trade sweep like any trade: what it would sink closes before it, at the price before.
+    function test_TheTimelocksSaleLiquidatesWhatItSinksFirst() public {
+        vm.prank(ALICE);
+        uint256 id = engine.openLong{value: 0.1 ether}(5, 0);
+        assertFalse(engine.isLiquidatable(id));
+        uint256 stakers = engine.totalEth();
+        uint256 insurance = engine.insuranceEth();
+        uint256 held = L.excessHeld();
+        vm.recordLogs();
+        vm.prank(TL);
+        uint256 eth = L.sellHeld(0, 0, TL);
+        assertGt(eth, 0);
+        assertEq(engine.openCount(), 0, "liquidated inside the sale, before its swap moved the price");
+        assertEq(engine.unabsorbedEth(), 0, "no bad debt");
+        assertGe(engine.totalEth(), stakers, "the stakers' ETH whole");
+        assertGe(engine.insuranceEth(), insurance, "the insurance untouched");
+        assertLt(
+            L.excessHeld(), held / 10_000, "the sale still fee-free: the nested liquidation took nothing of its refund"
+        );
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i; i < logs.length; ++i) {
+            assertTrue(logs[i].topics[0] != keccak256("BadDebt(uint256,uint256)"), "no BadDebt");
+        }
+        // the next ordinary trade finds nothing to liquidate
+        Trader buyer = new Trader(PM);
+        vm.deal(address(buyer), 1 ether);
+        buyer.swap(k, true, -0.001 ether);
+        assertEq(engine.unabsorbedEth(), 0);
+    }
+
+    /// The audit's low finding: a fee move left the perps stranded for good (the engine is bound to the pool it was
+    /// made on, and createPerps was one-shot). Now, once the move is done, createPerps makes a fresh pair on the new
+    /// pool from the same audited code, and the hook serves it; until a move, it still refuses a second creation.
+    function test_ThePerpsAreRecreatedAfterAFeeMove() public {
+        vm.prank(TL);
+        pool.lowerFee(33_300);
+        vm.prank(ALICE);
+        vm.expectRevert(); // the old engine's pool is the one left behind: empty (no depth for a position, no swap)
+        engine.openLong{value: 0.1 ether}(5, 0);
+        // the old vault's ETH side is still the stakers': withdrawable, as before
+        uint256 stakerBefore = STAKER.balance;
+        uint256 half = vault.ethShareOf(STAKER) / 2;
+        vm.prank(STAKER);
+        vault.withdrawEth(half);
+        assertGt(STAKER.balance, stakerBefore);
+        // the fresh pair, on the new pool
+        (address e2, address v2) = pool.createPerps{value: 0.01 ether}(_engineCode(), _vaultCode());
+        assertTrue(e2 != address(engine) && v2 != address(vault));
+        assertEq(pool.perpsEngine(), e2);
+        assertEq(pool.perpsVault(), v2);
+        assertEq(hook.perpEngine(), e2, "served at once");
+        assertEq(hook.poolEngine(), e2);
+        assertTrue(hook.perpRefunded(), "fee-free by refund again");
+        PerpEngine engine2 = PerpEngine(payable(e2));
+        assertEq(PoolId.unwrap(engine2.poolId()), PoolId.unwrap(pool.poolId()), "bound to the pool at 3.33%");
+        assertEq(engine2.owner(), TL);
+        assertEq(engine2.insuranceEth(), 0.01 ether);
+        // and once per pool: not again until the next move
+        vm.expectRevert(IMD6900LockedPool.PerpsExist.selector);
+        pool.createPerps(_engineCode(), _vaultCode());
+        // it trades: a long, opened and closed, fee-free
+        vm.prank(STAKER);
+        PerpVault(payable(v2)).depositEth{value: 5 ether}();
+        uint256 before = ALICE.balance;
+        vm.prank(ALICE);
+        uint256 id = engine2.openLong{value: 0.1 ether}(5, 0);
+        vm.prank(ALICE);
+        engine2.close(id, 0);
+        assertGe(ALICE.balance - (before - 0.1 ether), 0.0925 ether);
+        assertEq(engine2.unabsorbedEth(), 0);
+    }
+
+    /// The hook replaces only the engine the pool made, never one the timelock chose, and never one with positions open
+    function test_TheHookReplacesOnlyThePoolsOwnEngine() public {
+        vm.prank(TL);
+        pool.lowerFee(33_300);
+        vm.prank(TL);
+        hook.setPerpEngine(address(0xBEEF)); // the timelock's own choice
+        vm.expectRevert(IMD6900Hook.EngineSet.selector);
+        pool.createPerps(_engineCode(), _vaultCode());
+        vm.prank(TL);
+        hook.setPerpEngine(address(0)); // unwired: the pool may wire its fresh pair
+        (address e2,) = pool.createPerps(_engineCode(), _vaultCode());
+        assertEq(hook.perpEngine(), e2);
+        vm.expectRevert(IMD6900Hook.OnlyPool.selector);
+        hook.initPerpEngine(address(1));
+    }
+
+    /// The audit's low finding: setPerpEngine left perpRefunded on for a replacement that may not refund, so the
+    /// hook could report a 0 bps fee for an engine paying 4.44%. A replacement starts not refunded; the timelock says.
+    function test_AReplacementEngineIsNotReportedFeeFree() public {
+        assertTrue(hook.perpRefunded());
+        assertEq(hook.perpFeeBps(), 0);
+        vm.prank(TL);
+        hook.setPerpEngine(address(engine)); // the same engine: nothing changes
+        assertTrue(hook.perpRefunded());
+        vm.prank(TL);
+        hook.setPerpEngine(address(0xBEEF));
+        assertFalse(hook.perpRefunded(), "off until the timelock says the replacement refunds");
+        assertEq(hook.perpFeeBps(), 444, "the pool's fee, the safe side of the liquidation math");
+        vm.prank(TL);
+        hook.setPerpRefunded(true);
+        assertEq(hook.perpFeeBps(), 0);
+        vm.prank(TL);
+        hook.setPerpEngine(address(0));
+        assertFalse(hook.perpRefunded());
+    }
+
     function test_PerpFeesReachThePot() public {
         vm.prank(ALICE);
         engine.openLong{value: 0.3 ether}(2, 0); // a position is capped at 3.5% of the pool's depth
@@ -217,7 +326,9 @@ contract PerpsTest is Test {
         address expected = l.tokenAddress(salt);
         vm.deal(OWNER, BUY);
         vm.prank(OWNER);
-        (coin,) = l.launch{value: BUY}(salt, expected, uint160(_sqrt(FullMath.mulDiv(SUPPLY, 1 << 192, 19.18 ether))), 0, address(l));
+        (coin,) = l.launch{value: BUY}(
+            salt, expected, uint160(_sqrt(FullMath.mulDiv(SUPPLY, 1 << 192, 19.18 ether))), 0, address(l)
+        );
     }
 
     function _scan(bytes memory code, string memory what) internal pure {
@@ -239,8 +350,15 @@ contract PerpsTest is Test {
 
     /// @dev The launch from its build artifact (as deployed), rather than `new`: a test contract that embeds the
     ///      launch's creation code (and the PoolManager's, and the perps') costs the swarm's build machine too much
-    function _newLaunch(address owner_, IPoolManager pm, address imdstr_, address tl) internal returns (IMD6900RobinhoodLaunch) {
-        return IMD6900RobinhoodLaunch(payable(vm.deployCode("IMD6900RobinhoodLaunch.sol:IMD6900RobinhoodLaunch", abi.encode(owner_, pm, imdstr_, tl))));
+    function _newLaunch(address owner_, IPoolManager pm, address imdstr_, address tl)
+        internal
+        returns (IMD6900RobinhoodLaunch)
+    {
+        return IMD6900RobinhoodLaunch(
+            payable(vm.deployCode(
+                    "IMD6900RobinhoodLaunch.sol:IMD6900RobinhoodLaunch", abi.encode(owner_, pm, imdstr_, tl)
+                ))
+        );
     }
 
     function _engineCode() internal view returns (bytes memory) {

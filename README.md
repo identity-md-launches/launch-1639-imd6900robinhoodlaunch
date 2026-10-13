@@ -78,7 +78,7 @@ depends on the price the market left. `script/launch.sh recover` (`END_CLAIMS=1`
 `src/perps/`: PerpEngine and PerpVault (ported from MiFrens Cauldron's audited engine, the IMD6900 rules: 6.9% open fee
 on collateral, 2-5x, no bad debt by construction), with PerpSwapLib inlined (no DELEGATECALL anywhere). The engine's
 constructor binds to the live pool, so it can't exist before the coin: `IMD6900LockedPool.createPerps(engineCode,
-vaultCode)` creates it right after `launch()` (anyone, once; `script/launch.sh perps`), only from exactly this source
+vaultCode)` creates it right after `launch()` (anyone, once per pool; `script/launch.sh perps`), only from exactly this source
 (`ENGINE_CODE_HASH`, `VAULT_CODE_HASH`; test_ThePerpsCodeIsTheAuditedCode), with the ETH sent as insurance; the
 Robinhood timelock owns the engine from that same transaction and the hook serves it at once (`initPerpEngine`), so
 perps trade from the first block after the launch. Every later change is the timelock's (12h).
@@ -91,8 +91,13 @@ perps trade from the first block after the launch. Every later change is the tim
   would sink, at the price before it moves (a whale's dump liquidates the long first: no bad debt, stakers whole, the
   sender of the swap takes the keeper's cut). A sweep that can't run reverts the swap; the timelock (12h) can set
   `sweepFailOpen` or unwire the engine.
-- The engine is bound to its pool for good, so `lowerFee` refuses while it has positions open (or can't say); after a
-  move it fails closed until the timelock wires a new one.
+- The engine is bound to its pool for good, so `lowerFee` refuses while it has positions open (or can't say). After a
+  move, `createPerps` (anyone, the same audited code) makes a fresh engine and vault on the new pool and the hook
+  serves them at once; the old vault's stakers withdraw as before. The hook only ever replaces the engine the pool
+  made, with no positions open: one the timelock chose (`setPerpEngine`) stays until the timelock says.
+- The timelock's sale of held coins (`sellHeld`) gets the hook's pre-trade sweep like any trade: what it would sink
+  closes before it, at the price before it moves (so a sale that would sink more than one transaction can liquidate
+  is refused, like any trade: sell smaller).
 - Liquidity for perps is the community's: ETH stakers (longs borrow it), token stakers (shorts borrow it), in PerpVault.
 
 ## The liquidity: locked, its fees not

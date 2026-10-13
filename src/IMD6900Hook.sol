@@ -52,6 +52,8 @@ contract IMD6900Hook is BaseHook, Ownable {
 
     /// @notice The perps engine; zero means spot only
     address public perpEngine;
+    /// @notice The last engine the locked pool created and wired ({initPerpEngine}): the only one the pool may replace
+    address public poolEngine;
     /// @notice Escape hatch: trade even when the pre-trade sweep can't run (meant only while an engine is replaced)
     bool public sweepFailOpen;
     /// @notice The wired engine takes its fees back (IMD6900LockedPool.feeCheckpoint / feeRefund around each swap):
@@ -128,21 +130,35 @@ contract IMD6900Hook is BaseHook, Ownable {
         // not while the wired engine reports positions open: they close through it, and IMD6900LockedPool.lowerFee
         // asks it before a move (an engine that can't say is replaceable: the way out of a broken wiring)
         address cur = perpEngine;
-        if (cur != address(0) && cur != engine) {
-            (, bool open) = _openPositions(cur);
-            if (open) revert PerpsOpen();
+        if (cur != engine) {
+            if (cur != address(0)) {
+                (, bool open) = _openPositions(cur);
+                if (open) revert PerpsOpen();
+            }
+            // a replacement is not reported fee-free until the timelock says it refunds ({setPerpRefunded}): off, the
+            // engine assumes the pool's fee, which is the safe side of its liquidation math
+            if (perpRefunded) {
+                perpRefunded = false;
+                emit PerpRefundedSet(false);
+            }
         }
         perpEngine = engine;
         emit PerpEngineSet(engine);
     }
 
     /// @notice The perps engine the locked pool creates right after the launch (IMD6900LockedPool.createPerps), wired
-    ///         at once and fee-free by refund. Only the locked pool, only while no engine is set: every later change
-    ///         is the timelock's ({setPerpEngine}, {setPerpRefunded}).
+    ///         at once and fee-free by refund. Only the locked pool, only while no engine is set, or while the one set
+    ///         is the pool's last and holds no positions (the pool replaces it after a fee move, which binds it to the
+    ///         pool left behind): every other change is the timelock's ({setPerpEngine}, {setPerpRefunded}).
     function initPerpEngine(address engine) external {
         if (msg.sender != pool) revert OnlyPool();
-        if (perpEngine != address(0)) revert EngineSet();
-        perpEngine = engine;
+        address cur = perpEngine;
+        if (cur != address(0)) {
+            if (cur != poolEngine) revert EngineSet();
+            (bool known, bool open) = _openPositions(cur);
+            if (!known || open) revert PerpsOpen();
+        }
+        (perpEngine, poolEngine) = (engine, engine);
         perpRefunded = true;
         emit PerpEngineSet(engine);
         emit PerpRefundedSet(true);
@@ -180,12 +196,12 @@ contract IMD6900Hook is BaseHook, Ownable {
         return BaseHook.beforeInitialize.selector;
     }
 
-    function _beforeAddLiquidity(address sender, PoolKey calldata, ModifyLiquidityParams calldata params, bytes calldata)
-        internal
-        view
-        override
-        returns (bytes4)
-    {
+    function _beforeAddLiquidity(
+        address sender,
+        PoolKey calldata,
+        ModifyLiquidityParams calldata params,
+        bytes calldata
+    ) internal view override returns (bytes4) {
         _checkLiquidity(sender, params);
         return BaseHook.beforeAddLiquidity.selector;
     }
@@ -237,14 +253,18 @@ contract IMD6900Hook is BaseHook, Ownable {
     ///      that sent the transaction is the liquidator and takes the keeper's cut.
     function _sweep(address sender, int256 spec, bool isBuy, uint160 limit) internal {
         address engine = perpEngine;
-        // the launch's own swaps skip it too (the timelock's sale of held coins): a liquidation nested inside its fee
-        // refund window would take the sale's refund; what the sale sinks, the next trade's sweep closes
-        if (engine == address(0) || sender == engine || sender == ILockedPoolView(pool).launcher()) return;
+        if (engine == address(0) || sender == engine) return;
+        // the launch's own swaps (the timelock's sale of held coins) get the pre-trade sweep like any other trade: what
+        // the sale would sink closes at the price before it moves, inside the sale (the checkpoints are per caller,
+        // and the sale's swap has not earned anything yet). Only the post-trade sweep skips it: a liquidation nested
+        // there, between the sale's swap and its refund, would book the sale's fee away from it
+        if (spec == 0 && sender == ILockedPoolView(pool).launcher()) return;
         uint256 reserve = spec != 0 ? SWEEP_GAS_RESERVE + SWEEP_GAS_MIN : SWEEP_GAS_RESERVE;
         uint256 g = gasleft();
         if (g > reserve + SWEEP_GAS_MIN) {
-            (bool ok, bytes memory out) =
-                engine.call{gas: g - reserve}(abi.encodeCall(IPerpSweep.sweepLiquidations, (tx.origin, spec, isBuy, limit)));
+            (bool ok, bytes memory out) = engine.call{gas: g - reserve}(
+                abi.encodeCall(IPerpSweep.sweepLiquidations, (tx.origin, spec, isBuy, limit))
+            );
             if (spec == 0) return;
             if (!ok || out.length < 32) {
                 if (!sweepFailOpen) revert SweepUnavailable();

@@ -33,10 +33,11 @@ interface IPerpsSetup {
     function initPerpEngine(address engine) external;
 }
 
-/// @notice The hook's perps engine, and whether it has positions open
+/// @notice The hook's perps engine, whether it has positions open, and the pool it is bound to
 interface IPerpsWiring {
     function perpEngine() external view returns (address);
     function openCount() external view returns (uint256);
+    function poolId() external view returns (PoolId);
 }
 
 /// @title IMD6900LockedPool - the ETH / IMD6900 pool's liquidity on Robinhood Chain, locked for good
@@ -76,7 +77,7 @@ contract IMD6900LockedPool is ReentrancyGuard {
     /// @notice keccak256 of the perps engine's and vault's creation code (src/perps/PerpEngine.sol, PerpVault.sol at
     ///         this commit, built with this repository's compiler settings): the only perps {createPerps} creates.
     ///         test_ThePerpsCodeIsTheAuditedCode checks them against the build; change either source, change these.
-    bytes32 public constant ENGINE_CODE_HASH = 0x3ce566f987e94e7d6e37f1e6eae05488d1ec6893765f381bd37b12579e9ade3f;
+    bytes32 public constant ENGINE_CODE_HASH = 0x136b10b3b461616f618358a9d4ad7fff26b80ac920c5d8092be808bdb60c0651;
     bytes32 public constant VAULT_CODE_HASH = 0x20845fd74bc9ce4b2c159a32d2d0fb7328ceceb4dbb1557b6b7d9e16d8934d57;
     /// @dev Transient: a refunded caller's open checkpoint in this transaction, one slot per caller
     bytes32 internal constant CHECKPOINT_SEED = keccak256("IMD6900LockedPool.checkpoint");
@@ -157,7 +158,9 @@ contract IMD6900LockedPool is ReentrancyGuard {
         assembly ("memory-safe") {
             h := create2(0, add(init, 0x20), mload(init), salt)
         }
-        if (h == address(0) || uint160(h) & Hooks.ALL_HOOK_MASK != FLAGS || uint160(h) >> 152 == 0x91) revert BadHook();
+        if (h == address(0) || uint160(h) & Hooks.ALL_HOOK_MASK != FLAGS || uint160(h) >> 152 == 0x91) {
+            revert BadHook();
+        }
         hook = h;
         emit HookSet(h);
     }
@@ -244,10 +247,13 @@ contract IMD6900LockedPool is ReentrancyGuard {
 
     /*                                PERPS                                 */
 
-    /// @notice Creates the perps, once, right after the launch (anyone may: there is one way to do it): PerpEngine on
+    /// @notice Creates the perps, right after the launch (anyone may: there is one way to do it): PerpEngine on
     ///         this pool and its PerpVault, from exactly the audited code (by hash), the engine's fees to the launch,
     ///         the ETH sent as its insurance. The Robinhood timelock owns the engine from this same transaction, and the
-    ///         hook serves it at once (IMD6900Hook.initPerpEngine: fee-free by refund).
+    ///         hook serves it at once (IMD6900Hook.initPerpEngine: fee-free by refund). Once per pool: the engine is
+    ///         bound to the pool it was made on, so after {lowerFee} moves the liquidity (never with positions open)
+    ///         the same call makes a fresh pair on the new pool and the hook serves that one; until then it refuses.
+    ///         The hook replaces only the engine the pool made, with no positions open (never one the timelock chose).
     function createPerps(bytes calldata engineCode, bytes calldata vaultCode)
         external
         payable
@@ -255,11 +261,18 @@ contract IMD6900LockedPool is ReentrancyGuard {
         returns (address engine, address vault)
     {
         if (token == address(0)) revert NotOpen();
-        if (perpsEngine != address(0)) revert PerpsExist();
-        if (keccak256(engineCode) != ENGINE_CODE_HASH || keccak256(vaultCode) != VAULT_CODE_HASH) revert NotThePerpsCode();
+        address prior = perpsEngine;
+        if (prior != address(0) && PoolId.unwrap(IPerpsWiring(prior).poolId()) == PoolId.unwrap(poolKey().toId())) {
+            revert PerpsExist();
+        }
+        if (keccak256(engineCode) != ENGINE_CODE_HASH || keccak256(vaultCode) != VAULT_CODE_HASH) {
+            revert NotThePerpsCode();
+        }
         // PerpEngine(poolManager, hook, token, poolFee, tickSpacing, feeSink, owner): this contract owns it for the
         // setup below, then hands it to the timelock
-        engine = _create2(bytes.concat(engineCode, abi.encode(poolManager, hook, token, fee, TICK_SPACING, launcher, address(this))));
+        engine = _create2(
+            bytes.concat(engineCode, abi.encode(poolManager, hook, token, fee, TICK_SPACING, launcher, address(this)))
+        );
         vault = _create2(bytes.concat(vaultCode, abi.encode(engine)));
         (perpsEngine, perpsVault) = (engine, vault);
         IPerpsSetup(engine).setVault(vault);
