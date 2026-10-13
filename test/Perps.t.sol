@@ -3,7 +3,7 @@ pragma solidity ^0.8.26;
 
 import {Test} from "forge-std/Test.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
-import {PoolManager} from "@uniswap/v4-core/src/PoolManager.sol"; // keep: it puts the PoolManager in the build for vm.deployCode
+import {PoolManager} from "@uniswap/v4-core/src/PoolManager.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
@@ -42,7 +42,7 @@ contract PerpsTest is Test {
     PoolKey k;
 
     function setUp() public {
-        PM = IPoolManager(vm.deployCode("PoolManager.sol:PoolManager", abi.encode(address(this))));
+        PM = IPoolManager(address(new PoolManager(address(this)))); // `new`: a proof modelled on this compiles only what it imports
         (L, hook, pool) = _deploy();
         t = _launch(L);
         vm.deal(address(this), 1 ether);
