@@ -227,8 +227,8 @@ contract IMD6900LockedPool is ReentrancyGuard {
         if (keccak256(engineCode) != ENGINE_CODE_HASH || keccak256(vaultCode) != VAULT_CODE_HASH) revert NotThePerpsCode();
         // PerpEngine(poolManager, hook, token, poolFee, tickSpacing, feeSink, owner): this contract owns it for the
         // setup below, then hands it to the timelock
-        engine = _create2(abi.encodePacked(engineCode, abi.encode(poolManager, hook, token, fee, TICK_SPACING, launcher, address(this))));
-        vault = _create2(abi.encodePacked(vaultCode, abi.encode(engine)));
+        engine = _create2(bytes.concat(engineCode, abi.encode(poolManager, hook, token, fee, TICK_SPACING, launcher, address(this))));
+        vault = _create2(bytes.concat(vaultCode, abi.encode(engine)));
         (perpsEngine, perpsVault) = (engine, vault);
         IPerpsSetup(engine).setVault(vault);
         if (msg.value != 0) IPerpsSetup(engine).fundInsurance{value: msg.value}();
