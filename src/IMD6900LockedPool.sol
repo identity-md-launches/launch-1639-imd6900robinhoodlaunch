@@ -66,7 +66,7 @@ contract IMD6900LockedPool is ReentrancyGuard {
     /// @notice keccak256 of the perps engine's and vault's creation code (src/perps/PerpEngine.sol, PerpVault.sol at
     ///         this commit, built with this repository's compiler settings): the only perps {createPerps} creates.
     ///         test_ThePerpsCodeIsTheAuditedCode checks them against the build; change either source, change these.
-    bytes32 public constant ENGINE_CODE_HASH = 0x136b10b3b461616f618358a9d4ad7fff26b80ac920c5d8092be808bdb60c0651;
+    bytes32 public constant ENGINE_CODE_HASH = 0x3ce566f987e94e7d6e37f1e6eae05488d1ec6893765f381bd37b12579e9ade3f;
     bytes32 public constant VAULT_CODE_HASH = 0x20845fd74bc9ce4b2c159a32d2d0fb7328ceceb4dbb1557b6b7d9e16d8934d57;
     /// @dev Transient: a refunded caller's open checkpoint in this transaction, one slot per caller
     bytes32 internal constant CHECKPOINT_SEED = keccak256("IMD6900LockedPool.checkpoint");

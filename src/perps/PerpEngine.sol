@@ -860,8 +860,10 @@ contract PerpEngine is IUnlockCallback, Ownable, ReentrancyGuard {
     {
         if (openCount >= MAX_OPEN_POSITIONS) revert OiCapped();
         id = nextId++;
-        _addOpen(id, Position(trader, isLong, uint128(collateral), size, principal,
-            uint64(block.timestamp), leverage, fundingIndex));
+        // the struct in a local first: Slither (0.11) mis-reads a struct literal passed straight to an internal call
+        Position memory p = Position(trader, isLong, uint128(collateral), size, principal,
+            uint64(block.timestamp), leverage, fundingIndex);
+        _addOpen(id, p);
         emit Opened(id, trader, isLong, collateral, size, leverage);
     }
 
